@@ -1,35 +1,55 @@
-import numpy as np
-from itertools import combinations
+"""
+PyEPO-based comparison on the 5x5 grid shortest-path benchmark.
 
-from solvers import GBM_nonparametric
-import utils
+Runs NUM_TRIALS independent trials per DGP degree and compares:
+  - GBM_twostage  : prediction-focused (two-stage) HistGradientBoosting baseline
+  - LASSO_twostage: prediction-focused (two-stage) least-squares LASSO baseline
+  - LinearSPOPlus : decision-focused linear model trained with PyEPO's SPO+ loss
 
-rng = np.random.default_rng(seed=42)
-D = 40
-P = 5
-H = 0.5
-DEG = 4
-NUM_TRIALS = 1
-NUM_TRAIN = 100
-NUM_VAL = int(NUM_TRAIN / 4)
-NUM_TEST = 1000
-RNG_SEED = 42
-B_FIXED = True
+The sweep is orchestrated by RegretExperiment (experiments.py) and the per-trial
+test regrets are drawn as a grouped boxplot by RegretBoxPlot (plots.py).
+"""
+from pyepo.model.grb import shortestPathModel
 
-B = []
-if B_FIXED:
-    B.append(rng.binomial(1, 0.5, size=(D, P)))
-else:
-    for _ in range(NUM_TRIALS):
-        B.append(rng.binomial(1, 0.5, size=(D, P)))
+from solvers import GBM_twostage, LASSO_twostage, LinearSPOPlus
+from experiments import RegretExperiment
+from plots import RegretBoxPlot
 
-PATHS = utils.create_paths()
-PATH_MATRIX = utils.create_path_matrix(PATHS, D)
+NUM_TRIALS = 50
+DEGREES = [1, 2, 4, 6, 8]
 
-DATASETS = utils.generate_test_val_train_data(D, P, B[0], DEG, H, NUM_TRAIN, NUM_VAL, NUM_TEST, rng)
+optmodel = shortestPathModel(grid=(5, 5))
 
-X_TRAIN, C_TRAIN = DATASETS[0], DATASETS[1]
-X_VAL, C_VAL = DATASETS[2], DATASETS[3]
-X_TEST, C_TEST = DATASETS[4], DATASETS[5]
+experiment = RegretExperiment(
+    optmodel=optmodel,
+    solvers=[
+        ("gbm", GBM_twostage),
+        ("lasso", LASSO_twostage),
+        ("spo", LinearSPOPlus),
+    ],
+    num_features=5,
+    noise_width=0.5,
+    num_train=100,
+    num_test=1000,
+    num_trials=NUM_TRIALS,
+    degrees=DEGREES,
+    rng_seed=42,
+)
+results = experiment.run()
 
-GBM_solver = GBM_nonparametric(D, P, H, B, NUM_TRAIN, NUM_TEST, NUM_TRIALS, PATHS, PATH_MATRIX)
+plotter = RegretBoxPlot(
+    groups=DEGREES,
+    series=[
+        ("gbm", "2-stage GBM", "tab:blue"),
+        ("lasso", "2-stage LASSO", "tab:green"),
+        ("spo", "SPO+ linear", "tab:orange"),
+    ],
+    xlabel="Polynomial degree of DGP",
+    ylabel="Test regret (%)",
+    title=f"Two-stage GBM vs LASSO vs SPO+ linear over {NUM_TRIALS} trials "
+          f"(5x5 grid shortest path)",
+)
+plotter.plot(results)
+plotter.save("regret_boxplot.png")
+print("Saved boxplot to regret_boxplot.png")
+plotter.show()

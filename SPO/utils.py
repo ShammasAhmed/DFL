@@ -112,26 +112,3 @@ def generate_test_val_train_data(D, P, curr_B, deg, H, num_train, num_val, num_t
 
     return X_train, C_train, X_val, C_val, X_test, C_test
 
-def model_spo_regret(model, path_matrix, X_val, C_val, num_val, scale_factor = 1):
-    """
-    Total validation SPO regret of a fitted sklearn regressor on scaled costs.
-
-    Input:
-        model: A fitted sklearn regressor mapping covariates to edge costs
-        path_matrix (np.ndarray): The path-edge incidence matrix of the SPP
-        X_val (np.ndarray): Validation covariates
-        C_val (np.ndarray): Validation costs
-        num_val (int): Validation set size
-        scale_factor (float): Scales costs to [0, 1] to assist GBM
-
-    Returns:
-        regret (float): The total regret of the model over the validation set
-    """
-    reg = 0.0
-    for v in range(num_val):
-        c_v = C_val[v]
-        z_v = evaluate_path_cost(solve_shortest_path(path_matrix, c_v), c_v)
-        p_v = np.clip(model.predict(X_val[v].reshape(1, -1)).flatten() * scale_factor, 0.001, None)
-        reg += evaluate_path_cost(solve_shortest_path(path_matrix, p_v), c_v) - z_v
-    return reg
-
