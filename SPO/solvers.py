@@ -202,7 +202,7 @@ class GBM_twostage:
         self.model = self.train()
 
     def train(self):
-        C_TRAIN_SCALED = self.C_TRAIN / self.scale_factor
+        C_TRAIN_SCALED = self.C_TRAIN    / self.scale_factor
 
         best_model, best_reg = None, np.inf
         for l2 in self.l2_grid:
