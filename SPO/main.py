@@ -17,7 +17,7 @@ Pick which to run in the __main__ block at the bottom.
 from pyepo.model.grb import shortestPathModel
 
 from solvers import GBM_twostage, LASSO_twostage, LinearSPOPlus
-from experiments import RegretExperiment, ContextExperiment
+from experiments import RegretExperiment, ContextExperiment, HistogramExperiment
 from plots import RegretBoxPlot
 
 # Shared configuration ------------------------------------------------------- #
@@ -87,7 +87,44 @@ def run_contexts(degree=4, n_contexts=200, shared_models=True, seed=RNG_SEED):
     )
     return experiment.print_table()
 
+def run_histogram(degree=4, n_trials=50, seed=RNG_SEED):
+    """Vary training sets for a single fixed context and plot path distribution histograms."""
+    experiment = HistogramExperiment(
+        optmodel=optmodel,  # <-- Pass the real optmodel here
+        solvers=SOLVERS,
+        degree=degree,
+        n_trials=n_trials,
+        num_features=NUM_FEATURES,
+        noise_width=NOISE_WIDTH,
+        num_train=NUM_TRAIN,
+        rng_seed=seed,
+    )
+    
+    print(f"Building path matrix for grid {GRID}...")
+    experiment.compute_all_paths(grid=GRID)
+    
+    print(f"Running histogram experiment over {n_trials} independent training trials...")
+    experiment.run(grid=GRID)
+    
+    print("Generating visualizations...")
+    experiment.plot_histogram()
+    
+    return experiment.results
+
 
 if __name__ == "__main__":
-    run_contexts(degree=8, n_contexts=200)
+    # run_contexts(degree=8, n_contexts=1)
     # run_sweep(num_trials=50)
+    
+    # --- Execute the Contexts Experiment (Your original one) ---
+    print("=" * 50)
+    print("Running Contexts Experiment...")
+    print("=" * 50)
+    # run_contexts(degree=4, n_contexts=200, shared_models=True, seed=RNG_SEED)
+    
+    # --- Execute the New Histogram Experiment ---
+    print("\n" + "=" * 50)
+    print("Running Histogram Experiment...")
+    print("=" * 50)
+    results = run_histogram(degree=2, n_trials=2, seed=RNG_SEED)
+    print("Done!")

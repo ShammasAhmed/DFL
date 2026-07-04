@@ -8,8 +8,11 @@ the entry point only has to declare which solvers to compare and the config.
 """
 import numpy as np
 import torch
+from itertools import combinations
+import matplotlib.pyplot as plt
 
 import pyepo
+from pyepo.model.opt import optModel
 from pyepo.data.dataset import optDataset
 from torch.utils.data import DataLoader
 
@@ -274,3 +277,195 @@ class ContextExperiment:
         print(f"(over {self.n_contexts} contexts, {mode} models; "
               f"decision loss is mean realized cost, regrets are pooled %)")
         return table
+
+class HistogramExperiment:
+    """
+    Evaluates how often a learner selects specific paths across varying training sets
+    for a SINGLE, FIXED test context.
+    
+    Uses standard PyEPO solvers for training, but completely bypasses Gurobi during 
+    evaluation using a combinatorial path-edge incidence matrix.
+    """
+
+    def __init__(self, optmodel, solvers, degree, n_trials=50,
+                 num_features=5, noise_width=0.5, num_train=100, num_val=None,
+                 rng_seed=42):
+        self.optmodel = optmodel # Pass the real PyEPO optmodel here
+        self.solvers = list(solvers)
+        self.degree = degree
+        self.n_trials = n_trials
+        self.num_features = num_features
+        self.noise_width = noise_width
+        self.num_train = num_train
+        self.num_val = num_train // 4 if num_val is None else num_val
+        self.rng_seed = rng_seed
+        
+        self.all_paths = None
+        self.n_paths = None
+        self.fixed_x = None
+        self.fixed_y = None
+        self.fixed_fstar = None
+        self.results = None
+
+    def compute_all_paths(self, grid):
+        """Enumerate all monotone paths using your combinatorial layout."""
+        height, width = grid
+        right_moves = width - 1
+        down_moves = height - 1
+        total_moves = right_moves + down_moves
+        total_edges = height * right_moves + down_moves * width
+        
+        paths_list = []
+        for positions in combinations(range(total_moves), down_moves):
+            path = ['R'] * total_moves
+            for pos in positions:
+                path[pos] = 'D'
+            paths_list.append(''.join(path))
+            
+        path_matrix = np.zeros((len(paths_list), total_edges))
+        vertical_offset = height * right_moves
+        
+        for idx, path in enumerate(paths_list):
+            row, col = 0, 0
+            for move in path:
+                if move == 'R':
+                    path_matrix[idx, row * right_moves + col] = 1
+                    col += 1
+                elif move == 'D':
+                    path_matrix[idx, vertical_offset + row * width + col] = 1
+                    row += 1
+                    
+        self.all_paths = path_matrix
+        self.n_paths = len(paths_list)
+        return self.all_paths
+
+    def _generate_fixed_context(self, grid):
+        x, y = pyepo.data.shortestpath.genData(
+            1, self.num_features, grid, deg=self.degree, noise_width=self.noise_width, seed=self.rng_seed
+        )
+        _, fstar = pyepo.data.shortestpath.genData(
+            1, self.num_features, grid, deg=self.degree, noise_width=0.0, seed=self.rng_seed
+        )
+        self.fixed_x = x[0]
+        self.fixed_y = y[0]
+        self.fixed_fstar = fstar[0]
+
+    def _generate_train_data(self, seed, grid):
+        ntr, nv = self.num_train, self.num_val
+        n = ntr + nv
+        x, y = pyepo.data.shortestpath.genData(
+            n, self.num_features, grid, deg=self.degree, noise_width=self.noise_width, seed=seed
+        )
+        return x[:ntr], y[:ntr], x[ntr:], y[ntr:]
+
+    def _predict(self, solver, x_row):
+        with torch.no_grad():
+            x = torch.as_tensor(np.asarray(x_row).reshape(1, -1), dtype=torch.float32)
+            c_hat = solver.model(x)
+        return c_hat.detach().cpu().numpy().flatten()
+
+    def _get_shortest_path_index(self, cost_vec):
+        """Bypasses Gurobi entirely using vectorized matrix multiplication."""
+        path_costs = self.all_paths @ cost_vec
+        return np.argmin(path_costs)
+
+    def run(self, grid):
+        if self.all_paths is None:
+            self.compute_all_paths(grid)
+            
+        self._generate_fixed_context(grid)
+        
+        true_path_costs = self.all_paths @ self.fixed_fstar
+        sorted_indices = np.argsort(true_path_costs)
+        
+        path_counts = {key: np.zeros(self.n_paths, dtype=int) for key, _ in self.solvers}
+
+        for trial in range(self.n_trials):
+            trial_seed = self.rng_seed + 1000 + trial
+            x_tr, y_tr, x_val, y_val = self._generate_train_data(trial_seed, grid)
+            
+            for key, cls in self.solvers:
+                # 1. Pass the actual, real optmodel into PyEPO solvers for training
+                solver = cls(self.optmodel, x_tr, y_tr, x_val, y_val, seed=trial_seed)
+                
+                # 2. Get predictions
+                c_hat = self._predict(solver, self.fixed_x)
+                
+                # 3. Solve using matrix algebra argmin instead of calling Gurobi
+                chosen_idx = self._get_shortest_path_index(c_hat)
+                path_counts[key][chosen_idx] += 1
+
+        self.results = {
+            "true_path_costs": true_path_costs,
+            "sorted_indices": sorted_indices,
+            "counts": path_counts,
+            "true_optimal_idx": sorted_indices[0]
+        }
+        return self.results
+
+    def plot_histogram(self):
+        """
+        Generates the superimposed line graph (true costs) and histogram (selections)
+        separately for each solver evaluated. 
+        
+        Features:
+          - Blue 'x' markers indicating exact costs on the line curve.
+          - Total relative regret percentage included dynamically in the title.
+        """
+        if self.results is None:
+            raise ValueError("Experiment has not been run yet. Please execute run(grid) first.")
+            
+        res = self.results
+        sorted_idx = res["sorted_indices"]
+        sorted_costs = res["true_path_costs"][sorted_idx]
+        x_axis = np.arange(self.n_paths)
+        
+        # The cost of the absolutely optimal path under f*
+        z_star = sorted_costs[0]
+
+        for key in res["counts"].keys():
+            # Counts of how many times this solver picked each path across all trials
+            sorted_counts = res["counts"][key][sorted_idx]
+            
+            # --- Regret Calculation ---
+            # Total cost incurred by the model across all trials
+            total_realized_cost = np.sum(sorted_counts * sorted_costs)
+            # If the model chose perfectly every trial, the total cost would be:
+            total_optimal_cost = self.n_trials * z_star
+            
+            # Relative Regret % = (Sum(Loss) / Sum(Optimals)) * 100
+            total_loss = total_realized_cost - total_optimal_cost
+            relative_regret_pct = (total_loss / total_optimal_cost) * 100 if total_optimal_cost > 0 else 0.0
+            
+            # --- Plot Generation ---
+            fig, ax1 = plt.subplots(figsize=(11, 5))
+
+            # Primary Axis (Left): Line Graph of True Path Costs
+            color_line = 'tab:blue'
+            ax1.set_xlabel('Paths (Sorted by True Expected Cost Ascending)', fontsize=11)
+            ax1.set_ylabel('True Expected Path Cost ($f^{*T} w$)', color=color_line, fontsize=11)
+            
+            # Plot the line and superimpose blue 'x' markers at each path cost coordinate
+            ax1.plot(x_axis, sorted_costs, color=color_line, linewidth=2.5, label='Path Cost Curve')
+            ax1.scatter(x_axis, sorted_costs, color='blue', marker='x', s=40, zorder=3, label='Path Cost Point')
+            
+            ax1.tick_params(axis='y', labelcolor=color_line)
+            ax1.grid(True, alpha=0.3, linestyle=':')
+            
+            # Highlight the true optimal path (always index 0 on the sorted plot)
+            ax1.axvline(x=0, color='crimson', linestyle='--', alpha=0.8, label='True Optimal Path')
+
+            # Secondary Axis (Right): Histogram of Model Selections
+            ax2 = ax1.twinx()  
+            color_bar = 'tab:orange'
+            ax2.set_ylabel('Selection Count (across training sets)', color=color_bar, fontsize=11)
+            ax2.bar(x_axis, sorted_counts, color=color_bar, alpha=0.5, width=0.8, label='Model Selections')
+            ax2.tick_params(axis='y', labelcolor=color_bar)
+
+            # Title incorporating the relative regret percentage format
+            plt.title(f"Solver Path Selection Profile: {key}\n"
+                      f"Relative Regret: {relative_regret_pct:.2f}% | ({self.n_trials} Trials, Single Fixed Context)", 
+                      fontsize=13, fontweight='bold')
+            
+            fig.tight_layout()
+            plt.show()
