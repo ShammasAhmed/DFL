@@ -289,7 +289,7 @@ class HistogramExperiment:
 
     def __init__(self, optmodel, solvers, degree, n_trials=50,
                  num_features=5, noise_width=0.5, num_train=100, num_val=None,
-                 rng_seed=42):
+                 rng_seed=42, test_rng_seed=42):
         self.optmodel = optmodel # Pass the real PyEPO optmodel here
         self.solvers = list(solvers)
         self.degree = degree
@@ -299,6 +299,7 @@ class HistogramExperiment:
         self.num_train = num_train
         self.num_val = num_train // 4 if num_val is None else num_val
         self.rng_seed = rng_seed
+        self.test_rng_seed = test_rng_seed
         
         self.all_paths = None
         self.n_paths = None
@@ -341,10 +342,10 @@ class HistogramExperiment:
 
     def _generate_fixed_context(self, grid):
         x, y = pyepo.data.shortestpath.genData(
-            1, self.num_features, grid, deg=self.degree, noise_width=self.noise_width, seed=self.rng_seed
+            1, self.num_features, grid, deg=self.degree, noise_width=self.noise_width, seed=self.test_rng_seed
         )
         _, fstar = pyepo.data.shortestpath.genData(
-            1, self.num_features, grid, deg=self.degree, noise_width=0.0, seed=self.rng_seed
+            1, self.num_features, grid, deg=self.degree, noise_width=0.0, seed=self.test_rng_seed
         )
         self.fixed_x = x[0]
         self.fixed_y = y[0]

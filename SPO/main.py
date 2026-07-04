@@ -25,7 +25,8 @@ GRID = (5, 5)
 NUM_FEATURES = 5
 NOISE_WIDTH = 0.5
 NUM_TRAIN = 100
-RNG_SEED = 43
+RNG_SEED = 143
+TEST_RNG_SEED = 42
 
 # (key, solver_cls) for the experiments; (key, label, color) for the plot.
 SOLVERS = [
@@ -87,7 +88,7 @@ def run_contexts(degree=4, n_contexts=200, shared_models=True, seed=RNG_SEED):
     )
     return experiment.print_table()
 
-def run_histogram(degree=4, n_trials=50, seed=RNG_SEED):
+def run_histogram(degree=4, n_trials=5, seed=RNG_SEED, test_seed=TEST_RNG_SEED):
     """Vary training sets for a single fixed context and plot path distribution histograms."""
     experiment = HistogramExperiment(
         optmodel=optmodel,  # <-- Pass the real optmodel here
@@ -98,6 +99,7 @@ def run_histogram(degree=4, n_trials=50, seed=RNG_SEED):
         noise_width=NOISE_WIDTH,
         num_train=NUM_TRAIN,
         rng_seed=seed,
+        test_rng_seed=test_seed
     )
     
     print(f"Building path matrix for grid {GRID}...")
@@ -116,15 +118,9 @@ if __name__ == "__main__":
     # run_contexts(degree=8, n_contexts=1)
     # run_sweep(num_trials=50)
     
-    # --- Execute the Contexts Experiment (Your original one) ---
-    print("=" * 50)
-    print("Running Contexts Experiment...")
-    print("=" * 50)
-    # run_contexts(degree=4, n_contexts=200, shared_models=True, seed=RNG_SEED)
-    
     # --- Execute the New Histogram Experiment ---
     print("\n" + "=" * 50)
     print("Running Histogram Experiment...")
     print("=" * 50)
-    results = run_histogram(degree=2, n_trials=2, seed=RNG_SEED)
+    results = run_histogram(degree=2, n_trials=2, seed=RNG_SEED, test_seed=TEST_RNG_SEED)
     print("Done!")
