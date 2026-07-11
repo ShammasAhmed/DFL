@@ -18,7 +18,7 @@ def create_paths() -> list:
         paths.append(''.join(path))
     return paths
 
-def create_path_matrix(paths: list, D: int) -> np.ndarray:
+def compute_paths(paths: list, D: int) -> np.ndarray:
     """
     Create the path-edge incidence matrix using the paths list
 
@@ -70,7 +70,7 @@ def evaluate_path_cost(path_vector: np.ndarray, edge_costs: np.ndarray) -> float
     path_cost = np.dot(path_vector, edge_costs)
     return path_cost
 
-def generate_costs(X_matrix: np.ndarray, deg: int, h: float, D: int, P: int, curr_B: np.ndarray, rng: np.random.default_rng) -> np.ndarray:
+def generate_costs(X_matrix: np.ndarray, deg: int, h: float, D: int, P: int, B: np.ndarray, rng: np.random.default_rng) -> np.ndarray:
     """
     Generates costs of edges given a matrix of covariates X
 
@@ -79,36 +79,36 @@ def generate_costs(X_matrix: np.ndarray, deg: int, h: float, D: int, P: int, cur
         deg (int): The polynomial degree for the cost function
         h (float): The half width noise for the cost vector
         D (int): The number of edges
-        P (int): The number of features
-        curr_B (np.ndarray): A matrix 
+        P (int): The number of covariates
+        B (np.ndarray): The ground truth matrix
 
     Returns:
-        C_mat (np.ndarray): A matrix of costs for each sample/covariate
+        Y_matrix (np.ndarray): A matrix of costs for each sample/covariate
     """
     n = X_matrix.shape[0]
-    C_matrix = np.zeros((n, D))
+    Y_matrix = np.zeros((n, D))
     for t in range(n):
-        c = (((1 / np.sqrt(P)) * np.dot(curr_B, X_matrix[t]) + 3) ** deg + 1)
+        y = (((1 / np.sqrt(P)) * np.dot(B, X_matrix[t]) + 3) ** deg + 1)
         if h > 0:
-            c = c * rng.uniform(1 - h, 1 + h, size=D)
-        C_matrix[t] = c
-    return C_matrix
+            y = y * rng.uniform(1 - h, 1 + h, size=D)
+        Y_matrix[t] = y
+    return Y_matrix
 
 ## ---- SECTION 2: THE DECISION MAKING SETUP ---- ##
 
-def generate_test_val_train_data(D, P, curr_B, deg, H, num_train, num_val, num_test, rng):
+def generate_test_val_train_data(D, P, B, deg, h, num_train, num_val, num_test, rng):
     """
     Generate testing, validation, and training data at once
     """
     
     X_train = rng.standard_normal(size=(num_train, P))
-    C_train = generate_costs(X_train, deg, H, D, P, curr_B, rng)
+    Y_train = generate_costs(X_train, deg, h, D, P, B, rng)
 
     X_val = rng.standard_normal(size=(num_val, P))
-    C_val = generate_costs(X_val, deg, H, D, P, curr_B, rng)
+    Y_val = generate_costs(X_val, deg, h, D, P, B, rng)
 
     X_test = rng.standard_normal(size=(num_test, P))
-    C_test = generate_costs(X_test, deg, H, D, P, curr_B, rng)
+    Y_test = generate_costs(X_test, deg, h, D, P, B, rng)
 
-    return X_train, C_train, X_val, C_val, X_test, C_test
+    return X_train, Y_train, X_val, Y_val, X_test, Y_test
 

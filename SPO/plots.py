@@ -39,10 +39,10 @@ class RegretBoxPlot:
         self.figsize = figsize
         self.showfliers = showfliers
 
-        n_series = len(self.series)
+        num_series = len(self.series)
         if group_spacing is None:
             # Leave roughly one box-width of gap between adjacent groups.
-            group_spacing = (n_series + 1) * box_width
+            group_spacing = (num_series + 1) * box_width
         self.group_spacing = group_spacing
 
         self.fig = None
@@ -58,10 +58,10 @@ class RegretBoxPlot:
         Returns:
             (fig, ax): The matplotlib figure and axes
         """
-        n_series = len(self.series)
+        num_series = len(self.series)
         centers = np.arange(len(self.groups)) * self.group_spacing
         # Offsets place the series symmetrically around each group center.
-        offsets = (np.arange(n_series) - (n_series - 1) / 2) * self.box_width
+        offsets = (np.arange(num_series) - (num_series - 1) / 2) * self.box_width
         width = self.box_width * 0.85
 
         fig, ax = plt.subplots(figsize=self.figsize)
