@@ -23,6 +23,12 @@ DFL_VENV="${DFL_VENV:-$DFL_ROOT/.venv}"
 # by the preflight on the login node.
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$DFL_ROOT/.cache/matplotlib}"
 
+# Same story for bytecode: 500 tasks importing the same six modules would all try to
+# write __pycache__/ onto a shared filesystem at once. It also keeps the cluster
+# checkout clean, so `git pull` here never trips over regenerated .pyc files. The cost
+# is a few ms of recompilation per task, which is nothing next to the LP solves.
+export PYTHONDONTWRITEBYTECODE=1
+
 # Tried in order; the first one that loads wins. An entry may name several modules.
 #
 # python/3.11.9 is pinned deliberately -- it matches the interpreter requirements.txt
@@ -122,11 +128,18 @@ dfl_activate() {
     fi
     # dfl_bootstrap already activates the venv it just built; don't stack PATH twice.
     [ "${VIRTUAL_ENV:-}" = "$DFL_VENV" ] && return 0
-    # The activate script trips over `set -u` on older virtualenvs.
+
+    # The activate script trips over `set -u` on older virtualenvs, so drop it across
+    # the source -- but restore it exactly as we found it. This file gets sourced into
+    # interactive shells too (slurm/activate.sh), where forcing `set -u` on would make
+    # every unset variable a fatal error at the prompt.
+    local had_u=0
+    case "$-" in *u*) had_u=1 ;; esac
     set +u
     # shellcheck disable=SC1091
     source "$DFL_VENV/bin/activate"
-    set -u
+    [ "$had_u" -eq 1 ] && set -u
+    return 0
 }
 
 
