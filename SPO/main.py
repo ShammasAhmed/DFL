@@ -113,7 +113,7 @@ def run_histogram(deg=4, NUM_TRIALS=5, rng_seed=RNG_SEED):
 
 
 if __name__ == "__main__":
-    run_contexts(deg=2, num_contexts=1)
+    run_contexts(deg=2, num_contexts=1000)
     # run_sweep(NUM_TRIALS=25)
     
     # # --- Execute the New Histogram Experiment ---

@@ -186,6 +186,76 @@ class ContextExperiment:
         sol, _ = self.optmodel.solve()
         return np.asarray(sol)
 
+    def _compute_paths(self, grid):
+        """
+        Enumerate every monotone (right/down) source-to-sink path on the grid as an
+        (num_paths x num_edges) incidence matrix, cached on self.path_matrix.
+
+        Columns are indexed straight from optmodel.arcs (the cost-vector edge order),
+        so a row of this matrix is directly comparable to the incidence vector returned
+        by the Gurobi-backed _decision, regardless of PyEPO's internal edge layout.
+        Nodes are row-major (node = row*width + col); a right move is arc (node, node+1)
+        and a down move is arc (node, node+width).
+        """
+        height, width = grid
+        arc_index = {tuple(arc): j for j, arc in enumerate(self.optmodel.arcs)}
+        num_edges = len(self.optmodel.arcs)
+
+        right_moves = width - 1
+        down_moves = height - 1
+        total_moves = right_moves + down_moves
+
+        paths_list = []
+        for positions in combinations(range(total_moves), down_moves):
+            path = ['R'] * total_moves
+            for pos in positions:
+                path[pos] = 'D'
+            paths_list.append(path)
+
+        path_matrix = np.zeros((len(paths_list), num_edges))
+        for idx, path in enumerate(paths_list):
+            row, col = 0, 0
+            for move in path:
+                node = row * width + col
+                if move == 'R':
+                    path_matrix[idx, arc_index[(node, node + 1)]] = 1
+                    col += 1
+                else:  # 'D'
+                    path_matrix[idx, arc_index[(node, node + width)]] = 1
+                    row += 1
+
+        self.path_matrix = path_matrix
+        return path_matrix
+
+    def _decision_argmin(self, cost_vec):
+        """
+        Optimal decision via the precomputed path enumeration instead of Gurobi.
+
+        Minimizes path cost over self.path_matrix and returns the winning path's
+        incidence vector. Builds the matrix on first use. Intended as a drop-in
+        replacement for _decision; use _verify_decision to confirm they agree before
+        switching over.
+        """
+        if getattr(self, "path_matrix", None) is None:
+            self._compute_paths(self.grid)
+        cost_vec = np.asarray(cost_vec)
+        return self.path_matrix[np.argmin(self.path_matrix @ cost_vec)]
+
+    def _verify_decision(self, num_checks=100, seed=0):
+        """
+        Sanity check that _decision_argmin reproduces the Gurobi _decision exactly on
+        random cost vectors. Returns True if every incidence vector matches. Uses
+        continuous costs so optimal-path ties (measure zero) don't cause spurious
+        mismatches.
+        """
+        num_edges = self._compute_paths(self.grid).shape[1]
+        rng = np.random.default_rng(seed)
+        for _ in range(num_checks):
+            cost = rng.random(num_edges)
+            if not np.array_equal(self._decision(cost), self._decision_argmin(cost)):
+                return False
+        return True
+
     def _predict(self, solver, x_row):
         """Predicted cost vector for one context's covariates."""
         with torch.no_grad():
@@ -223,10 +293,10 @@ class ContextExperiment:
                 regret_fstar/regret_Y are the un-normalized regrets (numerators).
         """
         # <E[Y|X], z*(E[Y|X])>
-        opt_fstar = float(fstar_X @ self._decision(fstar_X))
+        opt_fstar = float(fstar_X @ self._decision_argmin(fstar_X))
 
         # z*(Y)
-        w_hat_y = self._decision(y_ctx)
+        w_hat_y = self._decision_argmin(y_ctx)
 
         # <Y, z*(Y)>
         opt_Y = float(y_ctx @ w_hat_y)
@@ -234,20 +304,20 @@ class ContextExperiment:
         per_solver = {}
         for key, solver in trained.items():
             # z*(f^{Method}(X))
-            w_hat = self._decision(self._predict(solver, x_ctx))
+            w_hat = self._decision_argmin(self._predict(solver, x_ctx))
 
             # <Y, z*(f^{Method)(X)>
             loss_Y = float(y_ctx @ w_hat)
 
             # 1. <Y, z*(f^{method}(X))>
-            # 2. <E[Y|X]}, z*(f^{method}(X))> - <E[Y|X], z*(E[Y|X])>
-            # 3. <E[Y|X]}, z*(f^{method}(X))> - <Y, z*(Y)>
+            # 2. <E[Y|X], z*(f^{method}(X))> - <E[Y|X], z*(E[Y|X])>
+            # 3. <E[Y|X], z*(f^{method}(X))> - <E[Y|X], z*(Y)>
             per_solver[key] = (loss_Y,
                                float(fstar_X @ w_hat) - opt_fstar,
                                float(fstar_X @ w_hat) - float(fstar_X @ w_hat_y))
             # per_solver[key] = (loss_Y,
             #                    float(fstar_X @ w_hat) - opt_fstar,
-            #                    float(fstar_X @ w_hat) - opt_Y)
+            #                    float(fstar_X @ w_hat) - float(fstar_X @ w_hat_y))
         return (opt_fstar, opt_Y), per_solver
 
     def _context_iter(self):
@@ -345,33 +415,56 @@ class HistogramExperiment:
         self.results = None
 
     def compute_paths(self, grid):
-        """Enumerate all monotone paths using your combinatorial layout."""
+        """
+        Enumerate all monotone (right/down) paths as a (num_paths x num_edges)
+        incidence matrix, cached on self.path_matrix.
+
+        Column order reproduces PyEPO's shortestPathModel arc ordering purely from the
+        grid (no PyEPO object needed): edges are laid out interleaved by row -- for each
+        row, its horizontal edges first, then the vertical edges leaving that row. Nodes
+        are row-major (node = row*width + col), so a right move is arc (node, node+1) and
+        a down move is arc (node, node+width). This matches the cost-vector edge order,
+        so a row of this matrix is comparable to a Gurobi shortest-path solution.
+        """
         height, width = grid
         right_moves = width - 1
         down_moves = height - 1
         total_moves = right_moves + down_moves
-        total_edges = height * right_moves + down_moves * width
-        
+
+        # Column index for every directed arc, in PyEPO's edge order.
+        arc_index = {}
+        j = 0
+        for r in range(height):
+            for c in range(width - 1):
+                node = r * width + c
+                arc_index[(node, node + 1)] = j
+                j += 1
+            if r < height - 1:
+                for c in range(width):
+                    node = r * width + c
+                    arc_index[(node, node + width)] = j
+                    j += 1
+        num_edges = j
+
         paths_list = []
         for positions in combinations(range(total_moves), down_moves):
             path = ['R'] * total_moves
             for pos in positions:
                 path[pos] = 'D'
-            paths_list.append(''.join(path))
-            
-        path_matrix = np.zeros((len(paths_list), total_edges))
-        vertical_offset = height * right_moves
-        
+            paths_list.append(path)
+
+        path_matrix = np.zeros((len(paths_list), num_edges))
         for idx, path in enumerate(paths_list):
             row, col = 0, 0
             for move in path:
+                node = row * width + col
                 if move == 'R':
-                    path_matrix[idx, row * right_moves + col] = 1
+                    path_matrix[idx, arc_index[(node, node + 1)]] = 1
                     col += 1
-                elif move == 'D':
-                    path_matrix[idx, vertical_offset + row * width + col] = 1
+                else:  # 'D'
+                    path_matrix[idx, arc_index[(node, node + width)]] = 1
                     row += 1
-                    
+
         self.path_matrix = path_matrix
         self.num_paths = len(paths_list)
         return self.path_matrix
