@@ -15,11 +15,13 @@
 
 set -euo pipefail
 
-module purge
-module load python/3.11            # TODO: your cluster's Python module
-source "$HOME/venvs/dfl/bin/activate"   # TODO: path to your venv
-# No Gurobi needed here: aggregate.py only touches numpy and matplotlib.
-
+# Slurm runs this script from a spool copy, so resolve the real SPO/ first.
 cd "$SLURM_SUBMIT_DIR"
+
+# shellcheck source=slurm/env.sh
+source slurm/env.sh
+dfl_load_python
+dfl_activate
+dfl_threads
 
 srun python aggregate.py --results results --outdir .

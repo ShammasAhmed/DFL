@@ -24,20 +24,17 @@
 
 set -euo pipefail
 
-module purge
-module load python/3.11            # TODO: your cluster's Python module
-source "$HOME/venvs/dfl/bin/activate"   # TODO: path to your venv
-# module load gurobi               # TODO: uncomment if Gurobi is a module here.
-#                                  # PyEPO's shortestPathModel builds a Gurobi model,
-#                                  # so the nodes need a working license (GRB_LICENSE_FILE).
-
-# Keep the numeric libraries inside the CPUs Slurm actually gave us; otherwise
-# each of the 25 concurrent tasks tries to grab the whole node.
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
-export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
-export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
-
+# Slurm runs this script from a spool copy, so resolve the real SPO/ first.
 cd "$SLURM_SUBMIT_DIR"
+
+# Python module, venv, and thread pinning all live in one place.
+# No Gurobi module needed: the 5x5 grid is 40 edge variables, comfortably inside the
+# 2000-variable limit of the restricted license bundled with pip's gurobipy.
+# shellcheck source=slurm/env.sh
+source slurm/env.sh
+dfl_load_python
+dfl_activate
+dfl_threads
 
 # --- Task ID -> (deg, num_train, trial) --------------------------------------
 # Must match sweep.cells(): trial varies fastest, then degree, then size.

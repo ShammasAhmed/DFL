@@ -1,0 +1,14 @@
+# Bootstrapped by SPO/slurm/env.sh -- multi-GB, never commit it.
+.venv/
+SPO/.venv/
+
+# Matplotlib font cache, shared by the array tasks.
+.cache/
+SPO/.cache/
+
+# Slurm job output and per-trial results.
+SPO/logs/
+SPO/results/
+
+__pycache__/
+*.py[cod]
