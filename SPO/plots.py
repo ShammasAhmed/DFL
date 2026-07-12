@@ -48,12 +48,14 @@ class RegretBoxPlot:
         self.fig = None
         self.ax = None
 
-    def plot(self, data):
+    def plot(self, data, ax=None):
         """
         Build the grouped boxplot.
 
         Inputs:
             data (dict): data[group][series_key] -> list of values (one per trial)
+            ax: Optional existing axes to draw into, for panelling several of these
+                into one figure. When omitted a new figure is created.
 
         Returns:
             (fig, ax): The matplotlib figure and axes
@@ -64,7 +66,11 @@ class RegretBoxPlot:
         offsets = (np.arange(num_series) - (num_series - 1) / 2) * self.box_width
         width = self.box_width * 0.85
 
-        fig, ax = plt.subplots(figsize=self.figsize)
+        owns_figure = ax is None
+        if owns_figure:
+            fig, ax = plt.subplots(figsize=self.figsize)
+        else:
+            fig = ax.figure
         handles = []
         for (key, _label, color), offset in zip(self.series, offsets):
             series_data = [data[g][key] for g in self.groups]
@@ -85,7 +91,8 @@ class RegretBoxPlot:
         ax.legend(handles, [label for _, label, _ in self.series], loc="upper left")
         ax.grid(axis="y", linestyle=":", alpha=0.5)
 
-        fig.tight_layout()
+        if owns_figure:
+            fig.tight_layout()
         self.fig, self.ax = fig, ax
         return fig, ax
 

@@ -19,24 +19,20 @@ from pyepo.model.grb import shortestPathModel
 from solvers import GBMTwoStage, LASSOTwoStage, LinearSPOPlus
 from experiments import RegretExperiment, ContextExperiment, HistogramExperiment
 from plots import RegretBoxPlot
+from sweep import RNG_SEED, SERIES
 
 # Shared configuration ------------------------------------------------------- #
 GRID = (5, 5)
 P = 5
 h = 0.5
 NUM_TRAIN = 100
-RNG_SEED = 143
 
-# (key, solver_cls) for the experiments; (key, label, color) for the plot.
+# (key, solver_cls) for the experiments. The matching (key, label, color) plot
+# series live in sweep.py, so the Slurm sweep and these local runs share them.
 SOLVERS = [
     ("gbm", GBMTwoStage),
     ("lasso", LASSOTwoStage),
     ("spo", LinearSPOPlus),
-]
-SERIES = [
-    ("gbm", "2-stage GBM", "tab:blue"),
-    ("lasso", "2-stage LASSO", "tab:green"),
-    ("spo", "SPO+ linear", "tab:orange"),
 ]
 
 optmodel = shortestPathModel(grid=GRID)
@@ -113,7 +109,7 @@ def run_histogram(deg=4, NUM_TRIALS=5, rng_seed=RNG_SEED):
 
 
 if __name__ == "__main__":
-    run_contexts(deg=2, num_contexts=1000)
+    run_contexts(deg=8, num_contexts=1000)
     # run_sweep(NUM_TRIALS=25)
     
     # # --- Execute the New Histogram Experiment ---
