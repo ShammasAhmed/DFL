@@ -1,10 +1,21 @@
 """
 Experiment orchestration for the shortest-path DFL comparison.
 
-RegretExperiment sweeps a set of polynomial degrees, runs independent trials with
-fresh data at each degree, trains each supplied solver, and collects the per-trial
-test regret (%). It owns the shared optimization model and the data generation, so
-the entry point only has to declare which solvers to compare and the config.
+None of these classes generate their own data: each takes a generator from
+datagen.py, a pure `gen(n, seed) -> Sample` that hands back covariates, realized
+costs, and (when the DGP can supply it) the conditional mean f* = E[Y | X]. The
+DGP is therefore swappable without touching an experiment, and whether f* exists
+is a property of the generator rather than something an experiment assumes.
+
+RegretExperiment sweeps a set of generators (degrees, by default), runs independent
+trials at each, and collects the per-trial test regret (%).
+
+ContextExperiment trains once and faces a batch of test contexts, reporting the
+metrics in sweep.METRICS -- all of them when the generator supplies f*, and only
+the ones that do not need it otherwise.
+
+HistogramExperiment varies the training set for a single fixed context and records
+which path each solver picks. It requires f*.
 """
 import numpy as np
 import torch
@@ -12,46 +23,123 @@ from itertools import combinations
 import matplotlib.pyplot as plt
 
 import pyepo
-from pyepo.model.opt import optModel
 from pyepo.data.dataset import optDataset
 from torch.utils.data import DataLoader
+
+from datagen import split
+from sweep import METRICS
+
+
+def metrics_for(has_fstar):
+    """
+    The metrics a ContextExperiment can compute, given whether it has f*.
+
+    Inputs:
+        has_fstar (bool): Whether the generator supplies the conditional mean
+
+    Returns:
+        metrics (tuple): Computable keys of sweep.METRICS, in registry order
+    """
+    return tuple(key for key, m in METRICS.items()
+                 if has_fstar or not m.needs_fstar)
+
+
+def build_path_matrix(optmodel):
+    """
+    Enumerate every monotone (right/down) source-to-sink path on the grid as a
+    (num_paths x num_edges) incidence matrix.
+
+    Columns are indexed straight from optmodel.arcs -- the cost-vector edge order --
+    so a row of this matrix is directly comparable to the incidence vector a Gurobi
+    solve returns, regardless of PyEPO's internal edge layout. Nodes are row-major
+    (node = row*width + col); a right move is arc (node, node+1) and a down move is
+    arc (node, node+width).
+
+    Inputs:
+        optmodel: The shortest-path optimization model, supplying both the grid and
+            the arc ordering
+
+    Returns:
+        path_matrix (np.ndarray): (num_paths x num_edges) incidence matrix
+    """
+    height, width = optmodel.grid
+    arc_index = {tuple(arc): j for j, arc in enumerate(optmodel.arcs)}
+    num_edges = len(optmodel.arcs)
+
+    down_moves = height - 1
+    total_moves = (width - 1) + down_moves
+
+    paths_list = []
+    for positions in combinations(range(total_moves), down_moves):
+        path = ['R'] * total_moves
+        for pos in positions:
+            path[pos] = 'D'
+        paths_list.append(path)
+
+    path_matrix = np.zeros((len(paths_list), num_edges))
+    for idx, path in enumerate(paths_list):
+        row, col = 0, 0
+        for move in path:
+            node = row * width + col
+            if move == 'R':
+                path_matrix[idx, arc_index[(node, node + 1)]] = 1
+                col += 1
+            else:  # 'D'
+                path_matrix[idx, arc_index[(node, node + width)]] = 1
+                row += 1
+    return path_matrix
+
+
+def predict(solver, x_row):
+    """Predicted cost vector for one context's covariates."""
+    with torch.no_grad():
+        x = torch.as_tensor(np.asarray(x_row).reshape(1, -1), dtype=torch.float32)
+        Y_hat = solver.model(x)
+    return Y_hat.detach().cpu().numpy().flatten()
 
 
 class RegretExperiment:
     """
-    Runs the degree sweep x trials and returns per-trial regrets for each solver.
+    Runs the sweep (one group per generator) x trials and returns per-trial regrets.
+
+    The regret here is pyepo.metric.regret, i.e. the SPO regret against realized
+    costs Y -- the same estimand as ContextExperiment's `regret_Y`. It never looks
+    at f*, so the generators handed to it can safely be built with with_fstar=False.
 
     Inputs:
         optmodel: The shortest-path optimization model, passed in by the caller.
-            Its `.grid` attribute is used to generate matching cost data, so the
-            optmodel is the single source of truth for the problem geometry.
+            The single source of truth for the problem geometry.
         solvers (list): Ordered list of (key, solver_cls) pairs. Each solver_cls is
             constructed as solver_cls(optmodel, X_TRAIN, Y_TRAIN, X_VAL, Y_VAL,
-            rng_seed=rng_seed) and must expose a `.model` scoreable by pyepo.metric.regret.
-        P (int): Covariate dimension
-        h (float): Multiplicative noise half-width
+            rng_seed=rng_seed) and must expose a `.model` scoreable by
+            pyepo.metric.regret.
+        groups (list): Ordered list of (label, gen) pairs -- one sweep group per
+            generator, labelled by whatever the sweep varies (polynomial degree, as
+            things stand). The label is the plot's x-axis group and, by default,
+            part of the seed.
         num_train, num_val, num_test (int): Split sizes. num_val defaults to
             num_train // 4 when left as None.
-        NUM_TRIALS (int): Independent trials per degree
-        degrees (iterable): Polynomial degrees of the DGP to sweep
-        rng_seed (int): Base seed; each (degree, trial) gets a distinct seed
-        verbose (bool): Print median regrets per degree as the sweep runs
+        NUM_TRIALS (int): Independent trials per group
+        rng_seed (int): Base seed; each (label, trial) gets a distinct seed
+        seed_fn (callable): seed_fn(label, trial) -> int, overriding how a trial's
+            seed is derived. Defaults to rng_seed + 1000 * label + trial, which
+            requires integer labels.
+        verbose (bool): Print median regrets per group as the sweep runs
     """
 
-    def __init__(self, optmodel, solvers, P=5, h=0.5,
+    def __init__(self, optmodel, solvers, groups,
                  num_train=100, num_val=None, num_test=1000, NUM_TRIALS=50,
-                 degrees=(1, 2, 4, 6, 8), rng_seed=42, verbose=True):
+                 rng_seed=42, seed_fn=None, verbose=True):
         self.optmodel = optmodel
-        self.grid = optmodel.grid
         self.solvers = list(solvers)
-        self.P = P
-        self.h = h
+        self.groups = list(groups)
         self.num_train = num_train
         self.num_val = num_train // 4 if num_val is None else num_val
         self.num_test = num_test
         self.NUM_TRIALS = NUM_TRIALS
-        self.degrees = list(degrees)
         self.rng_seed = rng_seed
+        self.seed_fn = seed_fn or (
+            lambda label, trial: self.rng_seed + 1000 * label + trial)
         self.verbose = verbose
 
         self.results = None
@@ -61,468 +149,390 @@ class RegretExperiment:
         Execute the sweep.
 
         Returns:
-            results (dict): results[degree][solver_key] -> list of per-trial
-                test regrets (%). Also stored on self.results.
+            results (dict): results[label][solver_key] -> list of per-trial test
+                regrets (%). Also stored on self.results.
         """
-        results = {deg: {key: [] for key, _ in self.solvers} for deg in self.degrees}
+        results = {label: {key: [] for key, _ in self.solvers}
+                   for label, _ in self.groups}
         n = self.num_train + self.num_val + self.num_test
 
-        for deg in self.degrees:
+        for label, gen in self.groups:
             for trial in range(self.NUM_TRIALS):
-                # Distinct DGP per (degree, trial); one genData call so B is
+                # Distinct DGP per (label, trial); one draw, so the ground truth B is
                 # shared across the train/val/test split within a trial.
-                seed = self.rng_seed + 1000 * deg + trial
-                X, Y = pyepo.data.shortestpath.genData(
-                    n, self.P, self.grid,
-                    deg=deg, noise_width=self.h, seed=seed,
-                )
-                X_TRAIN, Y_TRAIN, X_VAL, Y_VAL, X_TEST, Y_TEST = self._split(X, Y)
+                seed = self.seed_fn(label, trial)
+                train, val, test = split(gen(n, seed), self.num_train, self.num_val)
 
-                test_set = optDataset(self.optmodel, X_TEST, Y_TEST)
+                test_set = optDataset(self.optmodel, test.X, test.Y)
                 test_loader = DataLoader(test_set, batch_size=len(test_set),
                                          shuffle=False)
 
                 for key, solver_cls in self.solvers:
-                    solver = solver_cls(self.optmodel, X_TRAIN, Y_TRAIN,
-                                        X_VAL, Y_VAL, rng_seed=seed)
+                    solver = solver_cls(self.optmodel, train.X, train.Y,
+                                        val.X, val.Y, rng_seed=seed)
                     regret = 100 * pyepo.metric.regret(
                         solver.model, self.optmodel, test_loader)
-                    results[deg][key].append(regret)
+                    results[label][key].append(regret)
 
             if self.verbose:
-                self._print_medians(deg, results)
+                self._print_medians(label, results)
 
         self.results = results
         return results
 
-    def _split(self, X, Y):
-        ntr, nv = self.num_train, self.num_val
-        return (X[:ntr], Y[:ntr],
-                X[ntr:ntr + nv], Y[ntr:ntr + nv],
-                X[ntr + nv:], Y[ntr + nv:])
-
-    def _print_medians(self, deg, results):
-        parts = [f"{key} median {np.median(results[deg][key]):7.4f}%"
+    def _print_medians(self, label, results):
+        parts = [f"{key} median {np.median(results[label][key]):7.4f}%"
                  for key, _ in self.solvers]
-        print(f"DEG {deg:>2}: " + "  |  ".join(parts) +
+        print(f"GROUP {label:>2}: " + "  |  ".join(parts) +
               f"  ({self.NUM_TRIALS} trials)")
 
 
 class ContextExperiment:
     """
     Individual experiment: train each solver on shared train/val data, then have the
-    models face one or more test contexts and report, per solver, the average over
-    contexts of three quantities.
+    models face one or more test contexts and report, per solver, the pooled metrics.
 
-    For a test context X with realized costs Y and noiseless conditional mean
-    f* = E[Y | X], let w(c) = argmin_w c^T w be the optimal decision under cost c and
-    w_hat = w(Y_hat) the decision the model makes from its predicted costs:
+    For a test context X with realized costs Y and (where available) the noiseless
+    conditional mean f* = E[Y | X], let z*(c) = argmin_w c^T w be the optimal decision
+    under cost c, and w_hat = z*(f(X)) the decision a solver makes from its predicted
+    costs. The metrics are the entries of sweep.METRICS:
 
-        Decision Loss     : Y^T w_hat                  (realized cost of the path)
-        Regret rel. f*    : f*^T w_hat - f*^T w(f*)    (gap to the best policy)
-        Regret rel. Y     : Y^T w_hat  - Y^T w(Y)      (gap to the clairvoyant oracle)
+        loss_Y          : <Y, w_hat>                     realized cost of the path
+        regret_Y        : <Y, w_hat>  - <Y, z*(Y)>       SPO regret
+        regret_Y_lowvar : <f*, w_hat> - <f*, z*(Y)>      the same decision pair as
+                                                         regret_Y, but scored under f*
+                                                         rather than the noisy Y, so a
+                                                         lower-variance estimate of it
+        regret_fstar    : <f*, w_hat> - <f*, z*(f*)>     gap to the best policy
 
-    f* and Y for the same X are obtained from PyEPO's genData with noise_width 0 and
-    h respectively at a shared seed (same covariates and ground-truth B, differing only
-    in noise).
+    The last two need f*, so they exist only when the generator supplies it. Everything
+    available is always computed and returned; `metrics` selects only what print_table
+    shows, which is why changing the selection never requires recomputing a sweep.
 
-    With shared_models=True (default) the solvers are trained once and every context
-    is evaluated against those same models. With shared_models=False the solvers are
+    loss_Y is a plain mean over contexts. The regrets are pooled as
+    100 * (sum of regrets) / (sum of the corresponding optimal cost), the denominator
+    being sweep.METRICS[...].denom -- regret_Y and regret_Y_lowvar deliberately share
+    one, so the two sit on a single scale and can be read side by side.
+
+    With shared_models=True (default) the solvers are trained once and every context is
+    evaluated against those same models. With shared_models=False the solvers are
     retrained on a fresh DGP draw for each context.
 
     Inputs:
         optmodel: The shortest-path optimization model (single source of geometry)
         solvers (list): Ordered list of (key, solver_cls) pairs, constructed as
             solver_cls(optmodel, X_TRAIN, Y_TRAIN, X_VAL, Y_VAL, rng_seed=rng_seed)
-        deg (int): Polynomial degree of the DGP
-        num_contexts (int): Number of test contexts to average over
+        gen (callable): A datagen generator, gen(n, seed) -> Sample. Whether it
+            supplies f* decides which metrics are available.
+        num_contexts (int): Number of test contexts to pool over
         shared_models (bool): Reuse one trained set of models across all contexts
-        P (int): Covariate dimension
-        h (float): Multiplicative noise half-width
         num_train, num_val (int): Split sizes for the training data. num_val defaults
             to num_train // 4 when left as None.
+        metrics (iterable): Which metrics print_table displays, as keys of
+            sweep.METRICS. Defaults to every metric this generator makes available.
+            Naming one that needs f* against a generator without it is an error
+            rather than a silent drop.
         rng_seed (int): Seed for data generation and solver initialization
     """
 
-    def __init__(self, optmodel, solvers, deg, num_contexts=1, shared_models=True,
-                 P=5, h=0.5, num_train=100, num_val=None,
+    def __init__(self, optmodel, solvers, gen, num_contexts=1, shared_models=True,
+                 num_train=100, num_val=None, metrics=None,
                  rng_seed=42):
         self.optmodel = optmodel
-        self.grid = optmodel.grid
         self.solvers = list(solvers)
-        self.deg = deg
+        self.gen = gen
         self.num_contexts = num_contexts
         self.shared_models = shared_models
-        self.P = P
-        self.h = h
         self.num_train = num_train
         self.num_val = num_train // 4 if num_val is None else num_val
         self.rng_seed = rng_seed
+
+        # One cheap draw settles what this generator can offer, so an impossible
+        # metric selection fails here rather than midway through a sweep.
+        self.has_fstar = gen(1, rng_seed).fstar is not None
+        self.available = metrics_for(self.has_fstar)
+        self.metrics = self._resolve_metrics(metrics)
+
+        self.path_matrix = build_path_matrix(optmodel)
         self.table = None
 
+    def _resolve_metrics(self, metrics):
+        """
+        Validate the display selection against what this generator can support.
+
+        Inputs:
+            metrics (iterable | None): Requested metric keys, or None for every
+                metric available
+
+        Returns:
+            metrics (tuple): The validated selection
+
+        Raises:
+            ValueError: An unknown key, or one needing an f* the generator lacks.
+        """
+        if metrics is None:
+            return self.available
+        metrics = tuple(metrics)
+        for key in metrics:
+            if key not in METRICS:
+                raise ValueError(
+                    f"unknown metric {key!r}; known metrics are "
+                    f"{', '.join(METRICS)}")
+            if key not in self.available:
+                raise ValueError(
+                    f"metric {key!r} needs f*, but this generator does not supply "
+                    f"it (build it with with_fstar=True, or drop {key!r} from the "
+                    f"selection)")
+        return metrics
+
     def _generate(self, seed, num_test):
-        """Generate train/val data plus num_test contexts (covariates, Y, f*)."""
-        ntr, nv = self.num_train, self.num_val
-        n = ntr + nv + num_test
-        # Same seed, two noise levels: noisy costs Y and noiseless mean f*.
-        X, Y = pyepo.data.shortestpath.genData(
-            n, self.P, self.grid,
-            deg=self.deg, noise_width=self.h, seed=seed)
-        _, fstar_X = pyepo.data.shortestpath.genData(
-            n, self.P, self.grid,
-            deg=self.deg, noise_width=0.0, seed=seed)
-        train = (X[:ntr], Y[:ntr], X[ntr:ntr + nv], Y[ntr:ntr + nv])
-        test = (X[ntr + nv:], Y[ntr + nv:], fstar_X[ntr + nv:])
-        return train, test
+        """
+        Draw train/val data plus num_test contexts.
 
-    def _train(self, train):
-        X_TR, Y_TR, X_VAL, Y_VAL = train
-        return {key: cls(self.optmodel, X_TR, Y_TR, X_VAL, Y_VAL, rng_seed=self.rng_seed)
+        Inputs:
+            seed (int): Seed handed to the generator
+            num_test (int): Number of test contexts to carve off the draw
+
+        Returns:
+            (train, val, test) (tuple of Sample): One draw, split three ways, so the
+                ground truth is shared across the splits within a trial.
+        """
+        n = self.num_train + self.num_val + num_test
+        return split(self.gen(n, seed), self.num_train, self.num_val)
+
+    def _train(self, train, val):
+        return {key: cls(self.optmodel, train.X, train.Y, val.X, val.Y,
+                         rng_seed=self.rng_seed)
                 for key, cls in self.solvers}
-
-    def _decision(self, cost_vec):
-        """Optimal decision (path incidence vector) under the given cost vector."""
-        self.optmodel.setObj(np.asarray(cost_vec))
-        sol, _ = self.optmodel.solve()
-        return np.asarray(sol)
-
-    def _compute_paths(self, grid):
-        """
-        Enumerate every monotone (right/down) source-to-sink path on the grid as an
-        (num_paths x num_edges) incidence matrix, cached on self.path_matrix.
-
-        Columns are indexed straight from optmodel.arcs (the cost-vector edge order),
-        so a row of this matrix is directly comparable to the incidence vector returned
-        by the Gurobi-backed _decision, regardless of PyEPO's internal edge layout.
-        Nodes are row-major (node = row*width + col); a right move is arc (node, node+1)
-        and a down move is arc (node, node+width).
-        """
-        height, width = grid
-        arc_index = {tuple(arc): j for j, arc in enumerate(self.optmodel.arcs)}
-        num_edges = len(self.optmodel.arcs)
-
-        right_moves = width - 1
-        down_moves = height - 1
-        total_moves = right_moves + down_moves
-
-        paths_list = []
-        for positions in combinations(range(total_moves), down_moves):
-            path = ['R'] * total_moves
-            for pos in positions:
-                path[pos] = 'D'
-            paths_list.append(path)
-
-        path_matrix = np.zeros((len(paths_list), num_edges))
-        for idx, path in enumerate(paths_list):
-            row, col = 0, 0
-            for move in path:
-                node = row * width + col
-                if move == 'R':
-                    path_matrix[idx, arc_index[(node, node + 1)]] = 1
-                    col += 1
-                else:  # 'D'
-                    path_matrix[idx, arc_index[(node, node + width)]] = 1
-                    row += 1
-
-        self.path_matrix = path_matrix
-        return path_matrix
 
     def _decision_argmin(self, cost_vec):
         """
-        Optimal decision via the precomputed path enumeration instead of Gurobi.
+        Optimal decision (path incidence vector) under the given cost vector.
 
-        Minimizes path cost over self.path_matrix and returns the winning path's
-        incidence vector. Builds the matrix on first use. Intended as a drop-in
-        replacement for _decision; use _verify_decision to confirm they agree before
-        switching over.
+        Minimizes over the enumerated paths rather than calling Gurobi.
         """
-        if getattr(self, "path_matrix", None) is None:
-            self._compute_paths(self.grid)
         cost_vec = np.asarray(cost_vec)
         return self.path_matrix[np.argmin(self.path_matrix @ cost_vec)]
 
-    def _verify_decision(self, num_checks=100, seed=0):
+    def _eval_context(self, trained, x_ctx, y_ctx, fstar):
         """
-        Sanity check that _decision_argmin reproduces the Gurobi _decision exactly on
-        random cost vectors. Returns True if every incidence vector matches. Uses
-        continuous costs so optimal-path ties (measure zero) don't cause spurious
-        mismatches.
-        """
-        num_edges = self._compute_paths(self.grid).shape[1]
-        rng = np.random.default_rng(seed)
-        for _ in range(num_checks):
-            cost = rng.random(num_edges)
-            if not np.array_equal(self._decision(cost), self._decision_argmin(cost)):
-                return False
-        return True
+        Un-normalized per-solver numerators, and the denominators to pool them against,
+        for a single context.
 
-    def _predict(self, solver, x_row):
-        """Predicted cost vector for one context's covariates."""
-        with torch.no_grad():
-            x = torch.as_tensor(np.asarray(x_row).reshape(1, -1), dtype=torch.float32)
-            Y_hat = solver.model(x)
-        return Y_hat.detach().cpu().numpy().flatten()
+        The f*-dependent metrics are skipped entirely when fstar is None; every metric
+        the generator does support is computed, since each is only a dot product against
+        a decision already made here.
 
-    # def _eval_context(self, trained, x_ctx, y_ctx, fstar_X):
-    #     """
-    #     Raw per-context pieces for one context.
-
-    #     Returns:
-    #         (opt_fstar, opt_Y): the two benchmark optimal costs, and
-    #         per_solver: key -> (loss_Y, regret_fstar, regret_Y), where
-    #             regret_fstar/regret_Y are the un-normalized regrets (numerators).
-    #     """
-    #     opt_fstar = float(fstar_X @ self._decision(fstar_X))
-    #     opt_Y = float(y_ctx @ self._decision(y_ctx))
-    #     per_solver = {}
-    #     for key, solver in trained.items():
-    #         w_hat = self._decision(self._predict(solver, x_ctx))
-    #         loss_Y = float(y_ctx @ w_hat)
-    #         per_solver[key] = (loss_Y,
-    #                            float(fstar_X @ w_hat) - opt_fstar,
-    #                            realized - opt_Y)
-    #     return (opt_fstar, opt_Y), per_solver
-
-    def _eval_context(self, trained, x_ctx, y_ctx, fstar_X):
-        """
-        Raw per-context pieces for one context.
+        Inputs:
+            trained (dict): key -> trained solver
+            x_ctx (np.ndarray): The context's covariates
+            y_ctx (np.ndarray): The context's realized costs Y
+            fstar (np.ndarray | None): The context's conditional mean E[Y | X]
 
         Returns:
-            (opt_fstar, opt_Y): the two benchmark optimal costs, and
-            per_solver: key -> (loss_Y, regret_fstar, regret_Y), where
-                regret_fstar/regret_Y are the un-normalized regrets (numerators).
+            (denoms, per_solver): denoms maps a sweep.METRICS denom name to this
+                context's contribution to it; per_solver maps key -> {metric: value},
+                the values being the un-normalized numerators.
         """
-        # <E[Y|X], z*(E[Y|X])>
-        opt_fstar = float(fstar_X @ self._decision_argmin(fstar_X))
+        w_star_Y = self._decision_argmin(y_ctx)          # z*(Y)
+        opt_Y = float(y_ctx @ w_star_Y)                  # <Y, z*(Y)>
+        denoms = {"count": 1.0, "opt_Y": opt_Y, "opt_fstar": 0.0}
 
-        # z*(Y)
-        w_hat_y = self._decision_argmin(y_ctx)
-
-        # <Y, z*(Y)>
-        opt_Y = float(y_ctx @ w_hat_y)
+        if fstar is not None:
+            w_star_fstar = self._decision_argmin(fstar)  # z*(f*)
+            opt_fstar = float(fstar @ w_star_fstar)      # <f*, z*(f*)>
+            fstar_at_star_Y = float(fstar @ w_star_Y)    # <f*, z*(Y)>
+            denoms["opt_fstar"] = opt_fstar
 
         per_solver = {}
         for key, solver in trained.items():
-            # z*(f^{Method}(X))
-            w_hat = self._decision_argmin(self._predict(solver, x_ctx))
+            w_hat = self._decision_argmin(predict(solver, x_ctx))  # z*(f(X))
+            loss_Y = float(y_ctx @ w_hat)                                # <Y, z*(f(X))>
 
-            # <Y, z*(f^{Method)(X)>
-            loss_Y = float(y_ctx @ w_hat)
+            values = {"loss_Y": loss_Y,
+                      "regret_Y": loss_Y - opt_Y}
+            if fstar is not None:
+                fstar_at_hat = float(fstar @ w_hat)      # <f*, z*(f(X))>
+                values["regret_Y_lowvar"] = fstar_at_hat - fstar_at_star_Y
+                values["regret_fstar"] = fstar_at_hat - opt_fstar
+            per_solver[key] = values
 
-            # 1. <Y, z*(f^{method}(X))>
-            # 2. <E[Y|X], z*(f^{method}(X))> - <E[Y|X], z*(E[Y|X])>
-            # 3. <E[Y|X], z*(f^{method}(X))> - <E[Y|X], z*(Y)>
-            per_solver[key] = (loss_Y,
-                               float(fstar_X @ w_hat) - opt_fstar,
-                               float(fstar_X @ w_hat) - float(fstar_X @ w_hat_y))
-            # per_solver[key] = (loss_Y,
-            #                    float(fstar_X @ w_hat) - opt_fstar,
-            #                    float(fstar_X @ w_hat) - float(fstar_X @ w_hat_y))
-        return (opt_fstar, opt_Y), per_solver
+        return denoms, per_solver
 
     def _context_iter(self):
-        """Yield (trained_models, x, y, f*) for each context."""
+        """Yield (trained_models, x, y, f*) for each context; f* is None without one."""
+        def at(test, i):
+            return (test.X[i], test.Y[i],
+                    None if test.fstar is None else test.fstar[i])
+
         if self.shared_models:
-            train, (X_TE, Y_TE, fstar_X) = self._generate(self.rng_seed, self.num_contexts)
-            trained = self._train(train)
+            train, val, test = self._generate(self.rng_seed, self.num_contexts)
+            trained = self._train(train, val)
             for i in range(self.num_contexts):
-                yield trained, X_TE[i], Y_TE[i], fstar_X[i]
+                yield (trained, *at(test, i))
         else:
             for i in range(self.num_contexts):
-                train, (X_TE, Y_TE, fstar_X) = self._generate(self.rng_seed + i, 1)
-                trained = self._train(train)
-                yield trained, X_TE[0], Y_TE[0], fstar_X[0]
+                train, val, test = self._generate(self.rng_seed + i, 1)
+                trained = self._train(train, val)
+                yield (trained, *at(test, 0))
 
     def run(self):
         """
         Train and evaluate over all contexts.
 
         Returns:
-            table (dict): key -> {"loss_Y", "regret_fstar", "regret_Y"}.
-                loss_Y is the mean realized cost; the regrets are percentages,
-                pooled as 100 * (sum of regrets) / (sum of optimal costs) over the
-                contexts. Also stored on self.table.
+            table (dict): solver_key -> {metric: value} over every metric this
+                generator makes available (self.available), not merely the ones
+                selected for display. loss_Y is the mean realized cost; the regrets
+                are percentages pooled over the contexts against their denominators.
+                Also stored on self.table.
         """
-        sums = {key: {"loss_Y": 0.0, "regret_fstar": 0.0, "regret_Y": 0.0}
+        sums = {key: {metric: 0.0 for metric in self.available}
                 for key, _ in self.solvers}
-        opt_fstar_total = 0.0
-        opt_Y_total = 0.0
-        n = 0
+        totals = {"count": 0.0, "opt_Y": 0.0, "opt_fstar": 0.0}
 
-        for trained, x_ctx, y_ctx, fstar_X in self._context_iter():
-            (opt_fstar, opt_Y), per_solver = self._eval_context(
-                trained, x_ctx, y_ctx, fstar_X)
-            opt_fstar_total += opt_fstar
-            opt_Y_total += opt_Y
-            for key, (loss_Y, regret_fstar, regret_Y) in per_solver.items():
-                sums[key]["loss_Y"] += loss_Y
-                sums[key]["regret_fstar"] += regret_fstar
-                sums[key]["regret_Y"] += regret_Y
-            n += 1
+        for trained, x_ctx, y_ctx, fstar in self._context_iter():
+            denoms, per_solver = self._eval_context(trained, x_ctx, y_ctx, fstar)
+            for name, value in denoms.items():
+                totals[name] += value
+            for key, values in per_solver.items():
+                for metric, value in values.items():
+                    sums[key][metric] += value
+
+        def pool(key, metric):
+            denom = METRICS[metric].denom
+            if denom == "count":
+                return sums[key][metric] / totals["count"]
+            return 100 * sums[key][metric] / totals[denom]
 
         self.table = {
-            key: {
-                "loss_Y": sums[key]["loss_Y"] / n,
-                "regret_fstar": 100 * sums[key]["regret_fstar"] / opt_fstar_total,
-                "regret_Y": 100 * sums[key]["regret_Y"] / opt_Y_total,
-            }
+            key: {metric: pool(key, metric) for metric in self.available}
             for key, _ in self.solvers
         }
         return self.table
 
     def print_table(self):
-        """Run the experiment (if needed) and print the averaged results table."""
+        """
+        Run the experiment (if needed) and print the pooled results table.
+
+        Only the metrics in self.metrics are shown; self.table always holds every
+        metric the generator supports.
+
+        Returns:
+            table (dict): The full results table, as returned by run()
+        """
         table = self.table if self.table is not None else self.run()
-        header = f"{'Model':<10}{'Decision Loss':>15}{'Regret vs f*':>15}{'Regret vs Y':>15}"
+
+        header = f"{'Model':<10}" + "".join(
+            f"{METRICS[m].header:>18}" for m in self.metrics)
         print(header)
         print("-" * len(header))
         for key, _ in self.solvers:
-            row = table[key]
-            print(f"{key:<10}{row['loss_Y']:>15.4f}"
-                  f"{row['regret_fstar']:>14.4f}%{row['regret_Y']:>14.4f}%")
+            row = "".join(
+                f"{table[key][m]:>18.4f}" if METRICS[m].denom == "count"
+                else f"{table[key][m]:>17.4f}%"
+                for m in self.metrics)
+            print(f"{key:<10}" + row)
+
         mode = "shared" if self.shared_models else "per-context"
         print(f"(over {self.num_contexts} contexts, {mode} models; "
               f"decision loss is mean realized cost, regrets are pooled %)")
+        if not self.has_fstar:
+            print("(generator supplies no f*; f*-based metrics unavailable)")
         return table
 
 class HistogramExperiment:
     """
     Evaluates how often a learner selects specific paths across varying training sets
     for a SINGLE, FIXED test context.
-    
-    Uses standard PyEPO solvers for training, but completely bypasses Gurobi during 
+
+    Uses standard PyEPO solvers for training, but completely bypasses Gurobi during
     evaluation using a combinatorial path-edge incidence matrix.
+
+    Requires a generator that supplies f*: the paths are ranked by their true expected
+    cost <f*, w>, which is the curve the selection histograms are read against.
+
+    Inputs:
+        optmodel: The shortest-path optimization model, used to train the solvers
+        solvers (list): Ordered list of (key, solver_cls) pairs, constructed as
+            solver_cls(optmodel, X_TRAIN, Y_TRAIN, X_VAL, Y_VAL, rng_seed=rng_seed)
+        gen (callable): A datagen generator, gen(n, seed) -> Sample. Must supply f*.
+        NUM_TRIALS (int): Independent training sets the fixed context is faced with
+        num_train, num_val (int): Split sizes for the training data. num_val defaults
+            to num_train // 4 when left as None.
+        rng_seed (int): Seed for the fixed context; each trial's training draw is
+            seeded off it
     """
 
-    def __init__(self, optmodel, solvers, deg, NUM_TRIALS=50,
-                 P=5, h=0.5, num_train=100, num_val=None,
+    def __init__(self, optmodel, solvers, gen, NUM_TRIALS=50,
+                 num_train=100, num_val=None,
                  rng_seed=42):
-        self.optmodel = optmodel # Pass the real PyEPO optmodel here
+        self.optmodel = optmodel
         self.solvers = list(solvers)
-        self.deg = deg
+        self.gen = gen
         self.NUM_TRIALS = NUM_TRIALS
-        self.P = P
-        self.h = h
         self.num_train = num_train
         self.num_val = num_train // 4 if num_val is None else num_val
         self.rng_seed = rng_seed
-        
-        self.path_matrix = None
-        self.num_paths = None
+
+        self.path_matrix = build_path_matrix(optmodel)
+        self.num_paths = len(self.path_matrix)
         self.fixed_x = None
-        self.fixed_y = None
         self.fstar_X = None
         self.results = None
 
-    def compute_paths(self, grid):
+    def _generate_fixed_context(self):
         """
-        Enumerate all monotone (right/down) paths as a (num_paths x num_edges)
-        incidence matrix, cached on self.path_matrix.
+        Draw the one context every trial is evaluated against, and cache it.
 
-        Column order reproduces PyEPO's shortestPathModel arc ordering purely from the
-        grid (no PyEPO object needed): edges are laid out interleaved by row -- for each
-        row, its horizontal edges first, then the vertical edges leaving that row. Nodes
-        are row-major (node = row*width + col), so a right move is arc (node, node+1) and
-        a down move is arc (node, node+width). This matches the cost-vector edge order,
-        so a row of this matrix is comparable to a Gurobi shortest-path solution.
+        Raises:
+            ValueError: The generator supplies no f*, so the paths cannot be ranked
+                by their true expected cost.
         """
-        height, width = grid
-        right_moves = width - 1
-        down_moves = height - 1
-        total_moves = right_moves + down_moves
+        sample = self.gen(1, self.rng_seed)
+        if sample.fstar is None:
+            raise ValueError(
+                "HistogramExperiment ranks paths by their true expected cost, so it "
+                "needs f*; build the generator with with_fstar=True")
+        self.fixed_x = sample.X[0]
+        self.fstar_X = sample.fstar[0]
 
-        # Column index for every directed arc, in PyEPO's edge order.
-        arc_index = {}
-        j = 0
-        for r in range(height):
-            for c in range(width - 1):
-                node = r * width + c
-                arc_index[(node, node + 1)] = j
-                j += 1
-            if r < height - 1:
-                for c in range(width):
-                    node = r * width + c
-                    arc_index[(node, node + width)] = j
-                    j += 1
-        num_edges = j
-
-        paths_list = []
-        for positions in combinations(range(total_moves), down_moves):
-            path = ['R'] * total_moves
-            for pos in positions:
-                path[pos] = 'D'
-            paths_list.append(path)
-
-        path_matrix = np.zeros((len(paths_list), num_edges))
-        for idx, path in enumerate(paths_list):
-            row, col = 0, 0
-            for move in path:
-                node = row * width + col
-                if move == 'R':
-                    path_matrix[idx, arc_index[(node, node + 1)]] = 1
-                    col += 1
-                else:  # 'D'
-                    path_matrix[idx, arc_index[(node, node + width)]] = 1
-                    row += 1
-
-        self.path_matrix = path_matrix
-        self.num_paths = len(paths_list)
-        return self.path_matrix
-
-    def _generate_fixed_context(self, grid):
-        X, Y = pyepo.data.shortestpath.genData(
-            1, self.P, grid, deg=self.deg, noise_width=self.h, seed=self.rng_seed
-        )
-        _, fstar_X = pyepo.data.shortestpath.genData(
-            1, self.P, grid, deg=self.deg, noise_width=0.0, seed=self.rng_seed
-        )
-        self.fixed_x = X[0]
-        self.fixed_y = Y[0]
-        self.fstar_X = fstar_X[0]
-
-    def _generate_train_data(self, seed, grid):
-        ntr, nv = self.num_train, self.num_val
-        n = ntr + nv
-        X, Y = pyepo.data.shortestpath.genData(
-            n, self.P, grid, deg=self.deg, noise_width=self.h, seed=seed
-        )
-        return X[:ntr], Y[:ntr], X[ntr:], Y[ntr:]
-
-    def _predict(self, solver, x_row):
-        with torch.no_grad():
-            x = torch.as_tensor(np.asarray(x_row).reshape(1, -1), dtype=torch.float32)
-            Y_hat = solver.model(x)
-        return Y_hat.detach().cpu().numpy().flatten()
+    def _generate_train_data(self, seed):
+        """One trial's training draw, split into train and validation Samples."""
+        n = self.num_train + self.num_val
+        train, val, _ = split(self.gen(n, seed), self.num_train, self.num_val)
+        return train, val
 
     def _get_shortest_path_index(self, cost_vec):
         """Bypasses Gurobi entirely using vectorized matrix multiplication."""
         path_costs = self.path_matrix @ cost_vec
         return np.argmin(path_costs)
 
-    def run(self, grid):
-        if self.path_matrix is None:
-            self.compute_paths(grid)
-            
-        self._generate_fixed_context(grid)
-        
+    def run(self):
+        """
+        Face the fixed context with NUM_TRIALS independently trained solver sets.
+
+        Returns:
+            results (dict): The true path costs under f*, the ordering that sorts them
+                ascending, per-solver selection counts, and the true optimal path's
+                index. Also stored on self.results.
+        """
+        self._generate_fixed_context()
+
         true_path_costs = self.path_matrix @ self.fstar_X
         sorted_indices = np.argsort(true_path_costs)
-        
+
         path_counts = {key: np.zeros(self.num_paths, dtype=int) for key, _ in self.solvers}
 
         for trial in range(self.NUM_TRIALS):
             trial_seed = self.rng_seed + 1000 + trial
-            X_TR, Y_TR, X_VAL, Y_VAL = self._generate_train_data(trial_seed, grid)
-            
+            train, val = self._generate_train_data(trial_seed)
+
             for key, cls in self.solvers:
-                # 1. Pass the actual, real optmodel into PyEPO solvers for training
-                solver = cls(self.optmodel, X_TR, Y_TR, X_VAL, Y_VAL, rng_seed=trial_seed)
-                
-                # 2. Get predictions
-                Y_hat = self._predict(solver, self.fixed_x)
-                
-                # 3. Solve using matrix algebra argmin instead of calling Gurobi
-                chosen_idx = self._get_shortest_path_index(Y_hat)
+                solver = cls(self.optmodel, train.X, train.Y, val.X, val.Y,
+                             rng_seed=trial_seed)
+                chosen_idx = self._get_shortest_path_index(
+                    predict(solver, self.fixed_x))
                 path_counts[key][chosen_idx] += 1
 
         self.results = {
@@ -546,7 +556,7 @@ class HistogramExperiment:
           - Total relative regret percentage included dynamically in the title.
         """
         if self.results is None:
-            raise ValueError("Experiment has not been run yet. Please execute run(grid) first.")
+            raise ValueError("Experiment has not been run yet. Please execute run() first.")
             
         res = self.results
         sorted_idx = res["sorted_indices"]

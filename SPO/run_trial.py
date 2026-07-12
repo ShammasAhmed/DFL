@@ -3,8 +3,13 @@ One trial of the (degree x training-set-size) sweep.
 
 A trial is a single ContextExperiment: train the solvers once on a fresh DGP draw
 at (deg, num_train, seed), face NUM_CONTEXTS test contexts, and pool the metrics --
-so each trial collapses to one Regret vs f* and one Regret vs Y number per solver.
-That scalar is the thing the boxplots take their distribution over.
+so each trial collapses to one number per (solver, metric). That scalar is the thing
+the boxplots take their distribution over.
+
+Every metric the generator supports is written to the JSON, not merely the ones
+sweep.SHOW_METRICS currently displays. The columns are then a plotting-time choice
+(aggregate.py --metrics ...), so changing your mind about them never costs a rerun
+of the array.
 
 Invoked once per Slurm array task by slurm/trials.sbatch; aggregate.py reads the
 JSONs back and draws the plots.
@@ -16,10 +21,10 @@ import json
 import os
 import sys
 
-from main import optmodel, SOLVERS, P, h
-from experiments import ContextExperiment
+from main import optmodel, SOLVERS, gen_for
+from experiments import ContextExperiment, metrics_for
 from sweep import (DEGREES, SIZES, NUM_TRIALS, NUM_CONTEXTS, RESULT_DIR,
-                   seed_for, result_path)
+                   SHOW_METRICS, seed_for, result_path)
 
 
 def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DIR):
@@ -28,11 +33,9 @@ def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DI
     experiment = ContextExperiment(
         optmodel=optmodel,
         solvers=SOLVERS,
-        deg=deg,
+        gen=gen_for(deg),
         num_contexts=num_contexts,
         shared_models=True,
-        P=P,
-        h=h,
         num_train=num_train,
         rng_seed=seed,
     )
@@ -44,14 +47,8 @@ def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DI
         "trial": trial,
         "seed": seed,
         "num_contexts": num_contexts,
-        "metrics": {
-            key: {
-                "loss_Y": table[key]["loss_Y"],
-                "regret_fstar": table[key]["regret_fstar"],
-                "regret_Y": table[key]["regret_Y"],
-            }
-            for key, _ in SOLVERS
-        },
+        # Persist everything computed; aggregate.py selects columns at plot time.
+        "metrics": {key: dict(table[key]) for key, _ in SOLVERS},
     }
 
     path = result_path(outdir, deg, num_train, trial)
@@ -64,6 +61,33 @@ def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DI
     return record
 
 
+def is_reusable(path, gen):
+    """
+    Whether an existing trial JSON can stand in for recomputing this trial.
+
+    It can only if it already holds every metric a run today would compute. This is
+    what makes a resubmitted array safe: the resume path skips any trial whose JSON
+    exists, so a results/ directory written before a metric existed would otherwise
+    survive the resubmission untouched and go unnoticed until aggregation refused the
+    missing column -- two jobs and several hours later, with the array reporting
+    success. A stale or unreadable record is recomputed instead.
+
+    Inputs:
+        path (Path): Where this trial's JSON would live
+        gen (callable): The generator this trial would run on
+
+    Returns:
+        reusable (bool): True if the cached record is complete and current
+    """
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False  # missing, truncated, or not JSON -- recompute
+    expected = set(metrics_for(gen(1, 0).fstar is not None))
+    stored = record.get("metrics", {})
+    return all(expected <= set(stored.get(key, {})) for key, _ in SOLVERS)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deg", type=int, required=True, choices=DEGREES)
@@ -72,8 +96,9 @@ def parse_args(argv=None):
     parser.add_argument("--num-contexts", type=int, default=NUM_CONTEXTS)
     parser.add_argument("--outdir", default=str(RESULT_DIR))
     parser.add_argument("--overwrite", action="store_true",
-                        help="Recompute even if this trial's JSON already exists "
-                             "(default: skip, so a resubmitted array resumes).")
+                        help="Recompute even if this trial's JSON already exists and "
+                             "holds every current metric (default: skip, so a "
+                             "resubmitted array resumes).")
     args = parser.parse_args(argv)
     if not 0 <= args.trial < NUM_TRIALS:
         parser.error(f"--trial must be in [0, {NUM_TRIALS})")
@@ -84,13 +109,19 @@ def main(argv=None):
     args = parse_args(argv)
     path = result_path(args.outdir, args.deg, args.num_train, args.trial)
     if path.exists() and not args.overwrite:
-        print(f"{path} exists, skipping (pass --overwrite to recompute)")
-        return 0
+        if is_reusable(path, gen_for(args.deg)):
+            print(f"{path} exists, skipping (pass --overwrite to recompute)")
+            return 0
+        print(f"{path} is unreadable or predates the current metric set, recomputing")
 
     record = run_trial(args.deg, args.num_train, args.trial,
                        num_contexts=args.num_contexts, outdir=args.outdir)
-    parts = [f"{key} f*={m['regret_fstar']:.4f}% Y={m['regret_Y']:.4f}%"
-             for key, m in record["metrics"].items()]
+    # The JSON holds every metric; the log line shows the selected ones.
+    parts = [
+        f"{key} " + " ".join(
+            f"{metric}={m[metric]:.4f}" for metric in SHOW_METRICS if metric in m)
+        for key, m in record["metrics"].items()
+    ]
     print(f"deg={record['deg']} n={record['num_train']} trial={record['trial']} "
           f"seed={record['seed']}: " + "  |  ".join(parts))
     print(f"wrote {path}")

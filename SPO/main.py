@@ -1,11 +1,18 @@
 """
 Entry point for the 5x5 grid shortest-path DFL experiments.
 
-Two experiments are available, sharing the same optmodel and solver set:
+Three experiments are available, sharing the same optmodel and solver set:
   - run_sweep()    : NUM_TRIALS trials per DGP degree, drawn as a grouped boxplot
                      (RegretExperiment + RegretBoxPlot)
   - run_contexts() : train once, face num_contexts test contexts, print a table of
-                     Decision Loss / Regret vs f* / Regret vs Y (ContextExperiment)
+                     the sweep.SHOW_METRICS columns (ContextExperiment)
+  - run_histogram(): vary the training set against one fixed context, plot which
+                     paths each solver picks (HistogramExperiment)
+
+The DGP is passed in rather than baked in: gen_for(deg) builds the generator, and an
+experiment only sees `gen(n, seed) -> Sample`. Which metrics a run can report follows
+from whether that generator supplies f*, so run_sweep -- which never needs it -- asks
+for a cheaper generator that skips it.
 
 Solvers compared:
   - GBMTwoStage  : prediction-focused (two-stage) HistGradientBoosting baseline
@@ -16,10 +23,11 @@ Pick which to run in the __main__ block at the bottom.
 """
 from pyepo.model.grb import shortestPathModel
 
+from datagen import shortest_path_gen
 from solvers import GBMTwoStage, LASSOTwoStage, LinearSPOPlus
 from experiments import RegretExperiment, ContextExperiment, HistogramExperiment
 from plots import RegretBoxPlot
-from sweep import RNG_SEED, SERIES
+from sweep import RNG_SEED, SERIES, SHOW_METRICS
 
 # Shared configuration ------------------------------------------------------- #
 GRID = (5, 5)
@@ -38,17 +46,23 @@ SOLVERS = [
 optmodel = shortestPathModel(grid=GRID)
 
 
+def gen_for(deg, with_fstar=True):
+    """The DGP generator for one polynomial degree, at this run's shared config."""
+    return shortest_path_gen(GRID, P, h, deg, with_fstar=with_fstar)
+
+
 def run_sweep(NUM_TRIALS=50, degrees=(1, 2, 4, 6, 8), num_test=1000):
     """Degree sweep of per-trial test regret, saved/shown as a grouped boxplot."""
+    # Scored by pyepo.metric.regret, which never looks at f*, so don't pay to draw it.
+    groups = [(deg, gen_for(deg, with_fstar=False)) for deg in degrees]
+
     experiment = RegretExperiment(
         optmodel=optmodel,
         solvers=SOLVERS,
-        P=P,
-        h=h,
+        groups=groups,
         num_train=NUM_TRAIN,
         num_test=num_test,
         NUM_TRIALS=NUM_TRIALS,
-        degrees=degrees,
         rng_seed=RNG_SEED,
     )
     results = experiment.run()
@@ -68,17 +82,24 @@ def run_sweep(NUM_TRIALS=50, degrees=(1, 2, 4, 6, 8), num_test=1000):
     return results
 
 
-def run_contexts(deg=4, num_contexts=200, shared_models=True, rng_seed=RNG_SEED):
-    """Train once, face num_contexts test contexts, print the averaged metric table."""
+def run_contexts(deg=4, num_contexts=200, shared_models=True, rng_seed=RNG_SEED,
+                 metrics=SHOW_METRICS):
+    """
+    Train once, face num_contexts test contexts, print the pooled metric table.
+
+    `metrics` picks the columns; it defaults to sweep.SHOW_METRICS, so editing that
+    one tuple moves this table and aggregate.py's boxplot panels together. Every
+    metric the generator supports is computed regardless -- the selection only
+    decides what gets printed.
+    """
     experiment = ContextExperiment(
         optmodel=optmodel,
         solvers=SOLVERS,
-        deg=deg,
+        gen=gen_for(deg),
         num_contexts=num_contexts,
         shared_models=shared_models,
-        P=P,
-        h=h,
         num_train=NUM_TRAIN,
+        metrics=metrics,
         rng_seed=rng_seed,
     )
     return experiment.print_table()
@@ -86,25 +107,20 @@ def run_contexts(deg=4, num_contexts=200, shared_models=True, rng_seed=RNG_SEED)
 def run_histogram(deg=4, NUM_TRIALS=5, rng_seed=RNG_SEED):
     """Vary training sets for a single fixed context and plot path distribution histograms."""
     experiment = HistogramExperiment(
-        optmodel=optmodel,  # <-- Pass the real optmodel here
+        optmodel=optmodel,
         solvers=SOLVERS,
-        deg=deg,
+        gen=gen_for(deg),
         NUM_TRIALS=NUM_TRIALS,
-        P=P,
-        h=h,
         num_train=NUM_TRAIN,
         rng_seed=rng_seed,
     )
-    
-    print(f"Building path matrix for grid {GRID}...")
-    experiment.compute_paths(grid=GRID)
-    
+
     print(f"Running histogram experiment over {NUM_TRIALS} independent training trials...")
-    experiment.run(grid=GRID)
-    
+    experiment.run()
+
     print("Generating visualizations...")
     experiment.plot_histogram()
-    
+
     return experiment.results
 
 

@@ -8,8 +8,10 @@
 #   mkdir -p logs results
 #   sbatch slurm/trials.sbatch
 #
-# Each task writes results/deg{d}_n{n}_t{t}.json and skips itself if that file
-# already exists, so resubmitting after a failure only reruns the gaps.
+# Each task writes results/deg{d}_n{n}_t{t}.json and skips itself if that file already
+# exists AND holds every metric the current code computes, so resubmitting after a
+# failure only reruns the gaps -- while a results/ left over from before a metric was
+# added is recomputed rather than silently kept.
 
 #SBATCH --partition=main
 #SBATCH --account=guptavis_1305
@@ -39,7 +41,10 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
 # --- Task ID -> (deg, num_train, trial) --------------------------------------
-# Must match sweep.cells(): trial varies fastest, then degree, then size.
+# Trial varies fastest, then degree, then training-set size. The values below must
+# match DEGREES / SIZES / NUM_TRIALS in sweep.py, which run_trial.py validates its
+# arguments against -- a mismatch here fails the task rather than silently
+# mislabelling a cell.
 DEGREES=(1 2 4 6 8)
 SIZES=(100 1000)
 NUM_TRIALS=50

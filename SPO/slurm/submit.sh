@@ -36,4 +36,4 @@ echo "aggregation submitted:  ${agg_id} (waits on ${trials_id})"
 
 echo
 echo "watch:   squeue -j ${trials_id},${agg_id}"
-echo "rerun gaps: bash slurm/submit.sh   # finished trials skip themselves"
+echo "rerun gaps: bash slurm/submit.sh   # complete, current trials skip themselves"
