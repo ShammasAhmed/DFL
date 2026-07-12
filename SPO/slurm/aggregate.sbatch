@@ -15,13 +15,11 @@
 
 set -euo pipefail
 
-# Slurm runs this script from a spool copy, so resolve the real SPO/ first.
 cd "$SLURM_SUBMIT_DIR"
 
-# shellcheck source=slurm/env.sh
-source slurm/env.sh
-dfl_load_python
-dfl_activate
-dfl_threads
+# No Gurobi needed here: aggregate.py only touches numpy and matplotlib.
+module purge
+module load gcc/13.3.0 python/3.11.9
+source "$HOME/venvs/dfl/bin/activate"
 
 srun python aggregate.py --results results --outdir .
