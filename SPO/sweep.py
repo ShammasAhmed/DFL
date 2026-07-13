@@ -98,11 +98,13 @@ HIST_NUM_TRIALS = 500
 HIST_DGP_SEED = RNG_SEED        # fixes B, and so the true path costs
 HIST_CONTEXT_SEED = RNG_SEED    # draws the candidate contexts to choose from
 
-# Minimum % by which the context's best path must beat the second-best, so you can
-# plant an obvious winner. Selection sees only f*; the training draws are untouched.
-# 0.0 takes the first candidate, i.e. an ordinary random context.
-HIST_CONTEXT_MARGIN = 15.0
-HIST_CONTEXT_POOL = 200_000     # candidates scanned for the first one clearing the bar
+# The % by which the context's best path must beat the second-best must fall in
+# [HIST_CONTEXT_MARGIN, HIST_CONTEXT_MARGIN_MAX]. Raise the floor to plant an obvious
+# winner; lower the ceiling to plant a near-tie. Selection sees only f*; the training
+# draws are untouched. (0.0, None) is an ordinary random context.
+HIST_CONTEXT_MARGIN = 0.0
+HIST_CONTEXT_MARGIN_MAX = 0.1
+HIST_CONTEXT_POOL = 200_000     # candidates scanned for the first one in the window
 
 # Every trial draws this many rows regardless of training-set size, then takes the
 # first num_train for training and the next num_train // 4 for validation. Sizing the

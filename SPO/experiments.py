@@ -478,18 +478,18 @@ class HistogramExperiment:
             the two arms on one draw instead of confounding them.
         context_seed (int): Seed for the candidate contexts
         context_margin (float): Minimum % by which the chosen context's best path must
-            beat its second-best, letting you plant a context with an obvious winner.
-            The first candidate clearing it is taken. 0.0 takes the first candidate,
-            i.e. an ordinary random context.
-        context_pool (int): Candidates to scan for one clearing context_margin
+            beat its second-best. Raise it to plant an obvious winner.
+        context_margin_max (float): Maximum for the same gap; None for no cap. Lower it
+            to plant a near-tie, where the top two paths are all but indistinguishable.
+        context_pool (int): Candidates to scan for the first one inside the window
         seed_fn (callable): seed_fn(trial) -> int for the training draws. Must never
             return context_seed, or a trial would train on its own test context.
     """
 
     def __init__(self, optmodel, solvers, gen, NUM_TRIALS=50,
                  num_train=100, num_val=None, draw_size=None,
-                 context_seed=42, context_margin=0.0, context_pool=1,
-                 seed_fn=None):
+                 context_seed=42, context_margin=0.0, context_margin_max=None,
+                 context_pool=1, seed_fn=None):
         if not getattr(gen, "fixed_dgp", False):
             raise ValueError(
                 "HistogramExperiment needs a generator with a fixed ground truth B "
@@ -507,6 +507,8 @@ class HistogramExperiment:
                           else draw_size)
         self.context_seed = context_seed
         self.context_margin = context_margin
+        self.context_margin_max = (np.inf if context_margin_max is None
+                                   else context_margin_max)
         self.context_pool = context_pool
         self.seed_fn = seed_fn or (lambda trial: context_seed + 1000 + trial)
 
@@ -533,14 +535,13 @@ class HistogramExperiment:
         """
         Choose the fixed context and rank every path by its true expected cost.
 
-        The context is the decision problem every model is graded on, and a typical
-        draw is an easy one to get away with getting wrong: the optimal path often
-        beats the runner-up by only a few percent, so a solver that misses it barely
-        pays. context_margin lets you insist on a context where the optimum wins by at
-        least that percentage instead -- an obvious best path, everything else costly.
-        The first candidate clearing the bar is taken, so the context is defined by a
-        stated condition rather than by being the most extreme of however many were
-        drawn.
+        The context is the decision problem every model is graded on, and how much the
+        best path beats the second-best by decides what kind of problem it is. Raise
+        context_margin for an obvious winner (missing it is expensive); lower
+        context_margin_max for a near-tie (the top two are indistinguishable, so even a
+        good model flips between them -- but misses cost almost nothing). The first
+        candidate inside the window is taken, so the context is defined by a stated
+        condition rather than by being the most extreme of however many were drawn.
 
         The margin is measured on f* alone, and only the test context is chosen this
         way: B, the noise, and every training draw are untouched, so the selection
@@ -548,8 +549,8 @@ class HistogramExperiment:
         it and they all agree without sharing anything.
 
         Raises:
-            ValueError: The generator supplies no f*, or no candidate in the pool
-                clears context_margin.
+            ValueError: The generator supplies no f*, or no candidate in the pool falls
+                inside the margin window.
         """
         candidates = self.gen(self.context_pool, self.context_seed)
         if candidates.fstar is None:
@@ -562,13 +563,15 @@ class HistogramExperiment:
         best_two = np.partition(costs, 1, axis=1)[:, :2]
         margins = 100 * (best_two[:, 1] - best_two[:, 0]) / best_two[:, 0]
 
-        clears = np.flatnonzero(margins >= self.context_margin)
+        clears = np.flatnonzero((margins >= self.context_margin)
+                                & (margins <= self.context_margin_max))
         if not len(clears):
             raise ValueError(
                 f"No context in {self.context_pool} candidates has its best path "
-                f"beating the second-best by {self.context_margin}%; the largest gap "
-                f"found was {margins.max():.2f}%. Lower the margin, widen the pool, or "
-                f"raise the DGP degree -- a flatter DGP simply may not produce one.")
+                f"beating the second-best by between {self.context_margin}% and "
+                f"{self.context_margin_max}%; the gaps found run "
+                f"{margins.min():.4f}% to {margins.max():.2f}%. Widen the window or "
+                f"the pool.")
 
         self.context_index = int(clears[0])
         self.margin = float(margins[self.context_index])

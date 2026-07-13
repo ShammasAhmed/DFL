@@ -28,7 +28,7 @@ import numpy as np
 from main import histogram_experiment, SOLVERS
 from sweep import (HIST_DEG, HIST_SIZES, HIST_NUM_TRIALS, HIST_RESULT_DIR,
                    HIST_DGP_SEED, HIST_CONTEXT_SEED, HIST_CONTEXT_MARGIN,
-                   hist_seed_for, hist_result_path)
+                   HIST_CONTEXT_MARGIN_MAX, hist_seed_for, hist_result_path)
 
 SOLVER_KEYS = [key for key, _ in SOLVERS]
 
@@ -117,7 +117,8 @@ def main(argv=None):
     experiment = histogram_experiment(deg=args.deg, num_train=args.num_train,
                                       NUM_TRIALS=HIST_NUM_TRIALS)
     print(f"context #{experiment.context_index}: best path beats second-best by "
-          f"{experiment.margin:.2f}% (required >= {HIST_CONTEXT_MARGIN}%)")
+          f"{experiment.margin:.4f}% (window "
+          f"[{HIST_CONTEXT_MARGIN}%, {HIST_CONTEXT_MARGIN_MAX}%])")
 
     path = hist_result_path(args.outdir, args.num_train, args.trial)
     if path.exists() and not args.overwrite:
