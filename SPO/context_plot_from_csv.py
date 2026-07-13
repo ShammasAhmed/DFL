@@ -2,7 +2,7 @@
 Redraw the sweep's regret boxplots straight from trials.csv, without needing the
 per-trial JSONs (or any of the optimization stack) around.
 
-Same layout as aggregate.py -- one figure per training-set size, one panel per
+Same layout as context_aggregate.py -- one figure per training-set size, one panel per
 selected metric (--metrics, defaulting to sweep.SHOW_METRICS) -- with two
 differences:
   * the panels of a figure share one y-axis, so a box in one panel is directly
@@ -13,7 +13,7 @@ differences:
     regret_Y_lowvar routinely goes negative, since z*(Y) chases the noise and is
     beatable under f*.
 
-    python plot_from_csv.py [--csv trials.csv] [--outdir .] [--metrics ...] [--show]
+    python context_plot_from_csv.py [--csv trials.csv] [--outdir .] [--metrics ...] [--show]
 """
 import argparse
 import csv
@@ -39,7 +39,7 @@ def load_csv(path, metrics):
     trial values, the data[group][series_key] layout RegretBoxPlot consumes.
 
     Inputs:
-        path (str): The tidy per-trial CSV written by aggregate.py
+        path (str): The tidy per-trial CSV written by context_aggregate.py
         metrics (list): Metric columns to pull out, as keys of sweep.METRICS
 
     Returns:
@@ -114,7 +114,7 @@ def plot_size(by_size, metrics, num_train, outdir, show=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", default="trials.csv",
-                        help="Tidy per-trial CSV written by aggregate.py")
+                        help="Tidy per-trial CSV written by context_aggregate.py")
     parser.add_argument("--outdir", default=".", help="Where to write the PNGs")
     parser.add_argument("--metrics", default=",".join(SHOW_METRICS),
                         help="Comma-separated metrics to plot, one panel each "

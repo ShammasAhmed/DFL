@@ -15,7 +15,9 @@ metrics in sweep.METRICS -- all of them when the generator supplies f*, and only
 the ones that do not need it otherwise.
 
 HistogramExperiment varies the training set for a single fixed context and records
-which path each solver picks. It requires f*.
+which path each solver picks. It needs f*, and -- unlike the other two, whose every
+trial is one draw split into train and test -- it also needs the generator to pin its
+ground truth B, since it compares decisions made across many draws against one f*.
 """
 import numpy as np
 import torch
@@ -27,7 +29,8 @@ from pyepo.data.dataset import optDataset
 from torch.utils.data import DataLoader
 
 from datagen import split
-from sweep import METRICS
+from plots import PathHistogramPlot
+from sweep import METRICS, SERIES
 
 
 def metrics_for(has_fstar):
@@ -334,25 +337,25 @@ class ContextExperiment:
                 context's contribution to it; per_solver maps key -> {metric: value},
                 the values being the un-normalized numerators.
         """
-        w_star_Y = self._decision_argmin(y_ctx)          # z*(Y)
-        opt_Y = float(y_ctx @ w_star_Y)                  # <Y, z*(Y)>
+        z_star_Y = self._decision_argmin(y_ctx)          # z*(Y)
+        opt_Y = float(y_ctx @ z_star_Y)                  # <Y, z*(Y)>
         denoms = {"count": 1.0, "opt_Y": opt_Y, "opt_fstar": 0.0}
 
         if fstar is not None:
-            w_star_fstar = self._decision_argmin(fstar)  # z*(f*)
-            opt_fstar = float(fstar @ w_star_fstar)      # <f*, z*(f*)>
-            fstar_at_star_Y = float(fstar @ w_star_Y)    # <f*, z*(Y)>
+            z_star_fstar = self._decision_argmin(fstar)  # z*(f*)
+            opt_fstar = float(fstar @ z_star_fstar)      # <f*, z*(f*)>
+            fstar_at_star_Y = float(fstar @ z_star_Y)    # <f*, z*(Y)>
             denoms["opt_fstar"] = opt_fstar
 
         per_solver = {}
         for key, solver in trained.items():
-            w_hat = self._decision_argmin(predict(solver, x_ctx))  # z*(f(X))
-            loss_Y = float(y_ctx @ w_hat)                                # <Y, z*(f(X))>
+            z_hat = self._decision_argmin(predict(solver, x_ctx))  # z*(f(X))
+            loss_Y = float(y_ctx @ z_hat)                                # <Y, z*(f(X))>
 
             values = {"loss_Y": loss_Y,
                       "regret_Y": loss_Y - opt_Y}
             if fstar is not None:
-                fstar_at_hat = float(fstar @ w_hat)      # <f*, z*(f(X))>
+                fstar_at_hat = float(fstar @ z_hat)      # <f*, z*(f(X))>
                 values["regret_Y_lowvar"] = fstar_at_hat - fstar_at_star_Y
                 values["regret_fstar"] = fstar_at_hat - opt_fstar
             per_solver[key] = values
@@ -443,53 +446,91 @@ class ContextExperiment:
 
 class HistogramExperiment:
     """
-    Evaluates how often a learner selects specific paths across varying training sets
-    for a SINGLE, FIXED test context.
+    Evaluates how often a learner selects a path of each rank, across varying training
+    sets, for a SINGLE, FIXED test context.
 
     Uses standard PyEPO solvers for training, but completely bypasses Gurobi during
     evaluation using a combinatorial path-edge incidence matrix.
 
-    Requires a generator that supplies f*: the paths are ranked by their true expected
-    cost <f*, w>, which is the curve the selection histograms are read against.
+    The generator must supply f* AND pin its ground truth B (datagen.fixed_dgp) --
+    paths are ranked by their true expected cost <f*, w>, and that ranking is only
+    comparable to a model's decisions if the model trained on the B the f* came from.
+    A generator that redraws B per seed (shortest_path_gen) would hand every trial a
+    different ground truth and rank the paths under a fifth one, so it is refused here
+    rather than quietly producing a histogram of nothing.
+
+    A trial is one training draw, so trials are independent and self-contained: the
+    same trial run anywhere gives the same answer, which is what lets the Slurm array
+    farm them out one per task (histogram_trial.py) and count them up afterwards.
 
     Inputs:
         optmodel: The shortest-path optimization model, used to train the solvers
         solvers (list): Ordered list of (key, solver_cls) pairs, constructed as
             solver_cls(optmodel, X_TRAIN, Y_TRAIN, X_VAL, Y_VAL, rng_seed=rng_seed)
-        gen (callable): A datagen generator, gen(n, seed) -> Sample. Must supply f*.
+        gen (callable): A datagen generator, gen(n, seed) -> Sample, supplying f* and
+            a fixed B (see datagen.numpy_shortest_path_gen)
         NUM_TRIALS (int): Independent training sets the fixed context is faced with
         num_train, num_val (int): Split sizes for the training data. num_val defaults
             to num_train // 4 when left as None.
-        rng_seed (int): Seed for the fixed context; each trial's training draw is
-            seeded off it
+        draw_size (int): Rows each trial draws before splitting. Defaults to exactly
+            num_train + num_val; set it to the largest size's requirement to make a
+            small-n trial a prefix of the large-n one at the same seed, which pairs
+            the two arms on one draw instead of confounding them.
+        context_seed (int): Seed for the one fixed context
+        seed_fn (callable): seed_fn(trial) -> int for the training draws. Must never
+            return context_seed, or a trial would train on its own test context.
     """
 
     def __init__(self, optmodel, solvers, gen, NUM_TRIALS=50,
-                 num_train=100, num_val=None,
-                 rng_seed=42):
+                 num_train=100, num_val=None, draw_size=None,
+                 context_seed=42, seed_fn=None):
+        if not getattr(gen, "fixed_dgp", False):
+            raise ValueError(
+                "HistogramExperiment needs a generator with a fixed ground truth B "
+                "(datagen.numpy_shortest_path_gen), so that the f* ranking the paths "
+                "and the data the models train on come from one DGP. This generator "
+                "redraws B from every sample seed.")
+
         self.optmodel = optmodel
         self.solvers = list(solvers)
         self.gen = gen
         self.NUM_TRIALS = NUM_TRIALS
         self.num_train = num_train
         self.num_val = num_train // 4 if num_val is None else num_val
-        self.rng_seed = rng_seed
+        self.draw_size = (self.num_train + self.num_val if draw_size is None
+                          else draw_size)
+        self.context_seed = context_seed
+        self.seed_fn = seed_fn or (lambda trial: context_seed + 1000 + trial)
+
+        if self.draw_size < self.num_train + self.num_val:
+            raise ValueError(
+                f"draw_size {self.draw_size} is smaller than the "
+                f"{self.num_train} + {self.num_val} rows a trial splits out of it")
 
         self.path_matrix = build_path_matrix(optmodel)
         self.num_paths = len(self.path_matrix)
+
         self.fixed_x = None
         self.fstar_X = None
+        self.true_path_costs = None   # <f*, w> for every path, in path order
+        self.sorted_indices = None    # paths, cheapest true cost first
+        self.rank_of_path = None      # path index -> its rank in that ordering
         self.results = None
 
-    def _generate_fixed_context(self):
+        self.setup()
+
+    def setup(self):
         """
-        Draw the one context every trial is evaluated against, and cache it.
+        Draw the fixed context and rank every path by its true expected cost.
+
+        Cheap and deterministic, so every Slurm task recomputes it and they all agree
+        on the context and the ranking without anything having to be shared between
+        them.
 
         Raises:
-            ValueError: The generator supplies no f*, so the paths cannot be ranked
-                by their true expected cost.
+            ValueError: The generator supplies no f*, so the paths cannot be ranked.
         """
-        sample = self.gen(1, self.rng_seed)
+        sample = self.gen(1, self.context_seed)
         if sample.fstar is None:
             raise ValueError(
                 "HistogramExperiment ranks paths by their true expected cost, so it "
@@ -497,162 +538,99 @@ class HistogramExperiment:
         self.fixed_x = sample.X[0]
         self.fstar_X = sample.fstar[0]
 
-    def _generate_train_data(self, seed):
+        self.true_path_costs = self.path_matrix @ self.fstar_X
+        # Stable, so ties between equal-cost paths rank the same way in every task.
+        self.sorted_indices = np.argsort(self.true_path_costs, kind="stable")
+        self.rank_of_path = np.empty(self.num_paths, dtype=int)
+        self.rank_of_path[self.sorted_indices] = np.arange(self.num_paths)
+
+    def _train_data(self, trial):
         """One trial's training draw, split into train and validation Samples."""
-        n = self.num_train + self.num_val
-        train, val, _ = split(self.gen(n, seed), self.num_train, self.num_val)
+        sample = self.gen(self.draw_size, self.seed_fn(trial))
+        train, val, _ = split(sample, self.num_train, self.num_val)
         return train, val
 
     def _get_shortest_path_index(self, cost_vec):
         """Bypasses Gurobi entirely using vectorized matrix multiplication."""
         path_costs = self.path_matrix @ cost_vec
-        return np.argmin(path_costs)
+        return int(np.argmin(path_costs))
+
+    def run_trial(self, trial):
+        """
+        Train every solver on trial `trial`'s draw and see which path each then picks
+        for the fixed context.
+
+        This is the array job's unit of work, and the only place a model is trained.
+
+        Inputs:
+            trial (int): Which training draw to use
+
+        Returns:
+            chosen (dict): solver_key -> {"path": path index, "rank": its rank by true
+                expected cost, 0 being the true optimal path}
+        """
+        train, val = self._train_data(trial)
+        seed = self.seed_fn(trial)
+
+        chosen = {}
+        for key, cls in self.solvers:
+            solver = cls(self.optmodel, train.X, train.Y, val.X, val.Y,
+                         rng_seed=seed)
+            path = self._get_shortest_path_index(predict(solver, self.fixed_x))
+            chosen[key] = {"path": path, "rank": int(self.rank_of_path[path])}
+        return chosen
 
     def run(self):
         """
         Face the fixed context with NUM_TRIALS independently trained solver sets.
 
+        Runs the whole thing in this process; on the cluster the same trials are farmed
+        out one per array task instead (see histogram_trial.py), and both routes count
+        the same thing.
+
         Returns:
-            results (dict): The true path costs under f*, the ordering that sorts them
-                ascending, per-solver selection counts, and the true optimal path's
-                index. Also stored on self.results.
+            results (dict): The path costs under f* sorted ascending, and per-solver
+                counts of how often a path of each rank was chosen -- rank_counts[r]
+                being the number of trials whose chosen path was the r-th cheapest.
+                Also stored on self.results.
         """
-        self._generate_fixed_context()
-
-        true_path_costs = self.path_matrix @ self.fstar_X
-        sorted_indices = np.argsort(true_path_costs)
-
-        path_counts = {key: np.zeros(self.num_paths, dtype=int) for key, _ in self.solvers}
+        rank_counts = {key: np.zeros(self.num_paths, dtype=int)
+                       for key, _ in self.solvers}
 
         for trial in range(self.NUM_TRIALS):
-            trial_seed = self.rng_seed + 1000 + trial
-            train, val = self._generate_train_data(trial_seed)
-
-            for key, cls in self.solvers:
-                solver = cls(self.optmodel, train.X, train.Y, val.X, val.Y,
-                             rng_seed=trial_seed)
-                chosen_idx = self._get_shortest_path_index(
-                    predict(solver, self.fixed_x))
-                path_counts[key][chosen_idx] += 1
+            for key, chosen in self.run_trial(trial).items():
+                rank_counts[key][chosen["rank"]] += 1
 
         self.results = {
-            "true_path_costs": true_path_costs,
-            "sorted_indices": sorted_indices,
-            "counts": path_counts,
-            "true_optimal_idx": sorted_indices[0]
+            "sorted_costs": self.true_path_costs[self.sorted_indices],
+            "rank_counts": rank_counts,
+            "num_trials": self.NUM_TRIALS,
         }
         return self.results
 
-    def plot_histogram(self):
+    def plot_histogram(self, series=SERIES, subtitle=""):
         """
-        Generates the superimposed line graph (true costs) and histogram (selections)
-        separately for each solver evaluated. 
-        
-        Also generates a final summary plot superimposing all solvers' selections
-        on a single graph for direct comparison.
-        
-        Features:
-          - Blue 'x' markers indicating exact costs on the line curve.
-          - Total relative regret percentage included dynamically in the title.
+        Draw one selection histogram per solver over the true-cost curve, then a
+        side-by-side comparison of all of them.
+
+        The same PathHistogramPlot the Slurm aggregation uses, so a local run and a
+        1000-task array produce the same figure from the same counts.
+
+        Inputs:
+            series (list): (key, label, color) per solver, for the legends
+            subtitle (str): Appended to each title, e.g. the training-set size
+
+        Returns:
+            figs (list): The per-solver figures, then the comparison figure
         """
         if self.results is None:
-            raise ValueError("Experiment has not been run yet. Please execute run() first.")
-            
+            raise ValueError("Experiment has not been run yet; call run() first.")
+
         res = self.results
-        sorted_idx = res["sorted_indices"]
-        sorted_costs = res["true_path_costs"][sorted_idx]
-        x_axis = np.arange(self.num_paths)
-        
-        # The cost of the absolutely optimal path under f*
-        z_star = sorted_costs[0]
-
-        # --- Part 1: Individual Solver Plots ---
-        for key in res["counts"].keys():
-            # Counts of how many times this solver picked each path across all trials
-            sorted_counts = res["counts"][key][sorted_idx]
-            
-            # --- Regret Calculation ---
-            total_loss_fstar = np.sum(sorted_counts * sorted_costs)
-            total_optimal_cost = self.NUM_TRIALS * z_star
-            total_regret = total_loss_fstar - total_optimal_cost
-            relative_regret_pct = (total_regret / total_optimal_cost) * 100 if total_optimal_cost > 0 else 0.0
-            
-            # --- Plot Generation ---
-            fig, ax1 = plt.subplots(figsize=(11, 5))
-
-            # Primary Axis (Left): Line Graph of True Path Costs
-            color_line = 'tab:blue'
-            ax1.set_xlabel('Paths (Sorted by True Expected Cost Ascending)', fontsize=11)
-            ax1.set_ylabel('True Expected Path Cost ($f^{*T} w$)', color=color_line, fontsize=11)
-            
-            ax1.plot(x_axis, sorted_costs, color=color_line, linewidth=2.5, label='Path Cost Curve')
-            ax1.scatter(x_axis, sorted_costs, color='blue', marker='x', s=40, zorder=3, label='Path Cost Point')
-            
-            ax1.tick_params(axis='y', labelcolor=color_line)
-            ax1.grid(True, alpha=0.3, linestyle=':')
-            ax1.axvline(x=0, color='crimson', linestyle='--', alpha=0.8, label='True Optimal Path')
-
-            # Secondary Axis (Right): Histogram of Model Selections
-            ax2 = ax1.twinx()  
-            color_bar = 'tab:orange'
-            ax2.set_ylabel('Selection Count (across training sets)', color=color_bar, fontsize=11)
-            ax2.bar(x_axis, sorted_counts, color=color_bar, alpha=0.5, width=0.8, label='Model Selections')
-            ax2.tick_params(axis='y', labelcolor=color_bar)
-
-            plt.title(f"Solver Path Selection Profile: {key}\n"
-                      f"Relative Regret: {relative_regret_pct:.2f}% | ({self.NUM_TRIALS} Trials, Single Fixed Context)", 
-                      fontsize=13, fontweight='bold')
-            
-            fig.tight_layout()
-            plt.show()
-
-        # --- Part 2: Side-by-Side Multi-Solver Comparison Plot ---
-        fig, ax1 = plt.subplots(figsize=(12, 6))
-
-        # Left axis remains the continuous Path Cost Curve
-        color_line = 'tab:blue'
-        ax1.set_xlabel('Paths (Sorted by True Expected Cost Ascending)', fontsize=11)
-        ax1.set_ylabel('True Expected Path Cost ($f^{*T} w$)', color=color_line, fontsize=11)
-        
-        ax1.plot(x_axis, sorted_costs, color=color_line, linewidth=2.5, label='Path Cost Curve')
-        ax1.scatter(x_axis, sorted_costs, color='blue', marker='x', s=40, zorder=3)
-        ax1.axvline(x=0, color='crimson', linestyle='--', alpha=0.8, label='True Optimal Path')
-        ax1.tick_params(axis='y', labelcolor=color_line)
-        ax1.grid(True, alpha=0.3, linestyle=':')
-
-        # Right axis hosts all the histograms side-by-side at full opacity
-        ax2 = ax1.twinx()
-        ax2.set_ylabel('Selection Count (All Solvers Comparison)', color='black', fontsize=11)
-        
-        comparison_colors = ['#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
-        
-        # --- Side-by-Side Width Geometry ---
-        num_solvers = len(res["counts"])
-        total_group_width = 0.8  # Total space allocated for all bars combined per path
-        individual_bar_width = total_group_width / num_solvers
-        
-        for idx, (key, counts) in enumerate(res["counts"].items()):
-            sorted_counts = counts[sorted_idx]
-            color = comparison_colors[idx % len(comparison_colors)]
-            
-            # Compute the offset shift for this specific solver's bar
-            # Centers the grouped cluster over the true x-coordinate index
-            offset = (idx - (num_solvers - 1) / 2) * individual_bar_width
-            
-            # alpha=1.0 keeps the colors solid, vivid, and completely unmixed
-            ax2.bar(x_axis + offset, sorted_counts, color=color, alpha=1.0, 
-                    width=individual_bar_width, label=f"Selections: {key}")
-            
-        ax2.tick_params(axis='y', labelcolor='black')
-
-        # Combine legends from both independent axes safely
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', framealpha=0.9)
-
-        plt.title(f"Comparative Solver Path Selection Profile\n"
-                  f"Side-by-Side Histograms ({self.NUM_TRIALS} Trials, Single Fixed Context)", 
-                  fontsize=13, fontweight='bold')
-        
-        fig.tight_layout()
+        plotter = PathHistogramPlot(res["sorted_costs"], res["num_trials"],
+                                    series=series, subtitle=subtitle)
+        figs = [plotter.plot_solver(key, res["rank_counts"][key])
+                for key, _ in self.solvers]
+        figs.append(plotter.plot_comparison(res["rank_counts"]))
         plt.show()
+        return figs

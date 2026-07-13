@@ -1,12 +1,12 @@
 """
-Collect the per-trial JSONs written by run_trial.py and draw the sweep's boxplots.
+Collect the per-trial JSONs written by context_trial.py and draw the sweep's boxplots.
 
 One figure per training-set size, one panel per selected metric, so everything
 measured at that size sits in a single image. Within a panel, one group per DGP
 degree and one box per solver, each box summarizing the NUM_TRIALS trials of that
 cell.
 
-run_trial.py stores every metric it computed, so which panels get drawn is a choice
+context_trial.py stores every metric it computed, so which panels get drawn is a choice
 made here, not there: --metrics re-plots an existing sweep under a different
 selection without recomputing anything. It defaults to sweep.SHOW_METRICS, which
 main.py's printed table also follows.
@@ -14,7 +14,7 @@ main.py's printed table also follows.
 Also writes a tidy CSV of every trial and prints a median table. Deliberately imports
 no PyEPO/Gurobi, so it runs on a plain plotting node.
 
-    python aggregate.py [--results results] [--outdir .] [--metrics ...] [--show]
+    python context_aggregate.py [--results results] [--outdir .] [--metrics ...] [--show]
 """
 import argparse
 import json
@@ -163,7 +163,7 @@ def print_medians(by_size, metrics):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", default=str(RESULT_DIR),
-                        help="Directory of per-trial JSONs from run_trial.py")
+                        help="Directory of per-trial JSONs from context_trial.py")
     parser.add_argument("--outdir", default=".",
                         help="Where to write the PNGs and CSV")
     parser.add_argument("--metrics", default=",".join(SHOW_METRICS),

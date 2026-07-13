@@ -6,7 +6,7 @@
 #
 # Submit from the SPO/ directory:
 #   mkdir -p logs results
-#   sbatch slurm/trials.sbatch
+#   sbatch slurm/context_trials.sbatch
 #
 # Each task writes results/deg{d}_n{n}_t{t}.json and skips itself if that file already
 # exists AND holds every metric the current code computes, so resubmitting after a
@@ -42,7 +42,7 @@ export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
 # --- Task ID -> (deg, num_train, trial) --------------------------------------
 # Trial varies fastest, then degree, then training-set size. The values below must
-# match DEGREES / SIZES / NUM_TRIALS in sweep.py, which run_trial.py validates its
+# match DEGREES / SIZES / NUM_TRIALS in sweep.py, which context_trial.py validates its
 # arguments against -- a mismatch here fails the task rather than silently
 # mislabelling a cell.
 DEGREES=(1 2 4 6 8)
@@ -57,7 +57,7 @@ n="${SIZES[$(( cfg / ${#DEGREES[@]} ))]}"
 
 echo "task ${T}: deg=${deg} num_train=${n} trial=${trial} on $(hostname)"
 
-srun python run_trial.py \
+srun python context_trial.py \
     --deg "$deg" \
     --num-train "$n" \
     --trial "$trial" \

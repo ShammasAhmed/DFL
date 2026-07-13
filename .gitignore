@@ -9,6 +9,7 @@ SPO/.cache/
 # Slurm job output and per-trial results.
 SPO/logs/
 SPO/results/
+SPO/results_histogram/
 
 __pycache__/
 *.py[cod]

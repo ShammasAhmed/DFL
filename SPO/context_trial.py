@@ -8,13 +8,13 @@ the boxplots take their distribution over.
 
 Every metric the generator supports is written to the JSON, not merely the ones
 sweep.SHOW_METRICS currently displays. The columns are then a plotting-time choice
-(aggregate.py --metrics ...), so changing your mind about them never costs a rerun
+(context_aggregate.py --metrics ...), so changing your mind about them never costs a rerun
 of the array.
 
-Invoked once per Slurm array task by slurm/trials.sbatch; aggregate.py reads the
+Invoked once per Slurm array task by slurm/context_trials.sbatch; context_aggregate.py reads the
 JSONs back and draws the plots.
 
-    python run_trial.py --deg 4 --num-train 100 --trial 0
+    python context_trial.py --deg 4 --num-train 100 --trial 0
 """
 import argparse
 import json
@@ -47,14 +47,14 @@ def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DI
         "trial": trial,
         "seed": seed,
         "num_contexts": num_contexts,
-        # Persist everything computed; aggregate.py selects columns at plot time.
+        # Persist everything computed; context_aggregate.py selects columns at plot time.
         "metrics": {key: dict(table[key]) for key, _ in SOLVERS},
     }
 
     path = result_path(outdir, deg, num_train, trial)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write-then-rename: a task killed mid-write leaves no half-parsed JSON for
-    # aggregate.py to trip over.
+    # context_aggregate.py to trip over.
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(record, indent=2))
     os.replace(tmp, path)
