@@ -23,21 +23,26 @@ import json
 import os
 import sys
 
+import numpy as np
+
 from main import histogram_experiment, SOLVERS
 from sweep import (HIST_DEG, HIST_SIZES, HIST_NUM_TRIALS, HIST_RESULT_DIR,
-                   HIST_DGP_SEED, HIST_CONTEXT_SEED, hist_seed_for,
-                   hist_result_path)
+                   HIST_DGP_SEED, HIST_CONTEXT_SEED, HIST_CONTEXT_MARGIN,
+                   hist_seed_for, hist_result_path)
 
 SOLVER_KEYS = [key for key, _ in SOLVERS]
 
 
-def run_trial(num_train, trial, deg=HIST_DEG, outdir=HIST_RESULT_DIR):
+def sorted_costs_of(experiment):
+    """The true path costs of the experiment's fixed context, cheapest first."""
+    return [float(c) for c in
+            experiment.true_path_costs[experiment.sorted_indices]]
+
+
+def run_trial(experiment, num_train, trial, deg=HIST_DEG, outdir=HIST_RESULT_DIR):
     """Run one trial and write its record to JSON. Returns the record."""
-    experiment = histogram_experiment(deg=deg, num_train=num_train,
-                                      NUM_TRIALS=HIST_NUM_TRIALS)
     chosen = experiment.run_trial(trial)
 
-    sorted_costs = experiment.true_path_costs[experiment.sorted_indices]
     record = {
         "deg": deg,
         "num_train": num_train,
@@ -45,9 +50,14 @@ def run_trial(num_train, trial, deg=HIST_DEG, outdir=HIST_RESULT_DIR):
         "seed": hist_seed_for(trial),
         "dgp_seed": HIST_DGP_SEED,
         "context_seed": HIST_CONTEXT_SEED,
+        # Which candidate context was selected, and by how much its best path beats the
+        # second-best. Both follow from HIST_CONTEXT_MARGIN, so they pin down what this
+        # trial was actually graded against.
+        "context_index": experiment.context_index,
+        "context_margin": experiment.margin,
         # The blue curve. Identical in every record by construction; stored per record
         # so the aggregator can draw it without PyEPO, and cross-check it while it does.
-        "sorted_costs": [float(c) for c in sorted_costs],
+        "sorted_costs": sorted_costs_of(experiment),
         "chosen": chosen,
     }
 
@@ -60,21 +70,28 @@ def run_trial(num_train, trial, deg=HIST_DEG, outdir=HIST_RESULT_DIR):
     return record
 
 
-def is_reusable(path):
+def is_reusable(path, experiment):
     """
     Whether an existing trial JSON can stand in for recomputing this trial.
 
-    It can only if it holds a decision for every solver we run today, so a results
-    directory written before a solver was added is recomputed rather than silently
-    kept and later aggregated into a histogram missing a bar.
+    It can only if it holds a decision for every solver we run today AND was graded
+    against the context we would use today. The second check is what makes changing
+    HIST_CONTEXT_MARGIN safe: a new margin picks a different context, and without it a
+    resubmitted array would skip every trial whose JSON already exists and hand you a
+    histogram of the OLD context's ranks under a new context's cost curve -- wrong, and
+    silently so. A stale, unreadable, or differently-graded record is recomputed.
     """
     try:
         record = json.loads(path.read_text())
     except (OSError, ValueError):
         return False  # missing, truncated, or not JSON -- recompute
     chosen = record.get("chosen", {})
-    return (bool(record.get("sorted_costs"))
-            and all(key in chosen and "rank" in chosen[key] for key in SOLVER_KEYS))
+    if not all(key in chosen and "rank" in chosen[key] for key in SOLVER_KEYS):
+        return False
+    stored = record.get("sorted_costs")
+    current = sorted_costs_of(experiment)
+    return (stored is not None and len(stored) == len(current)
+            and np.allclose(stored, current, rtol=1e-6))
 
 
 def parse_args(argv=None):
@@ -94,14 +111,24 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    # Built before the reuse check, since deciding whether a cached record is still
+    # valid means knowing which context we would grade against today.
+    experiment = histogram_experiment(deg=args.deg, num_train=args.num_train,
+                                      NUM_TRIALS=HIST_NUM_TRIALS)
+    print(f"context #{experiment.context_index}: best path beats second-best by "
+          f"{experiment.margin:.2f}% (required >= {HIST_CONTEXT_MARGIN}%)")
+
     path = hist_result_path(args.outdir, args.num_train, args.trial)
     if path.exists() and not args.overwrite:
-        if is_reusable(path):
+        if is_reusable(path, experiment):
             print(f"{path} exists, skipping (pass --overwrite to recompute)")
             return 0
-        print(f"{path} is unreadable or predates the current solver set, recomputing")
+        print(f"{path} is unreadable, predates the current solver set, or was graded "
+              f"against a different context, recomputing")
 
-    record = run_trial(args.num_train, args.trial, deg=args.deg, outdir=args.outdir)
+    record = run_trial(experiment, args.num_train, args.trial, deg=args.deg,
+                       outdir=args.outdir)
 
     picks = "  |  ".join(
         f"{key} path={record['chosen'][key]['path']} "

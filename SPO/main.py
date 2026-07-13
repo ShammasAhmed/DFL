@@ -35,7 +35,7 @@ from experiments import RegretExperiment, ContextExperiment, HistogramExperiment
 from plots import RegretBoxPlot
 from sweep import (RNG_SEED, SERIES, SHOW_METRICS,
                    HIST_DEG, HIST_NUM_TRIALS, HIST_DGP_SEED, HIST_CONTEXT_SEED,
-                   HIST_DRAW, hist_seed_for)
+                   HIST_CONTEXT_MARGIN, HIST_CONTEXT_POOL, HIST_DRAW, hist_seed_for)
 
 # Shared configuration ------------------------------------------------------- #
 GRID = (5, 5)
@@ -128,13 +128,19 @@ def run_contexts(deg=4, num_contexts=200, shared_models=True, rng_seed=RNG_SEED,
     return experiment.print_table()
 
 def histogram_experiment(deg=HIST_DEG, num_train=NUM_TRAIN,
-                         NUM_TRIALS=HIST_NUM_TRIALS):
+                         NUM_TRIALS=HIST_NUM_TRIALS, margin=HIST_CONTEXT_MARGIN):
     """
     The configured HistogramExperiment, built the same way here and on the cluster.
 
     histogram_trial.py calls this for its one trial and main's run_histogram calls it
     for all of them, so a local run and the Slurm array face the same fixed context and
     train on the same draws.
+
+    `margin` is the % by which the fixed context's best path must beat its second-best;
+    it defaults to sweep.HIST_CONTEXT_MARGIN, which is what the array uses. Pass it here
+    only to try a margin out locally -- changing the one the cluster runs at means
+    editing sweep.HIST_CONTEXT_MARGIN, since all 1000 tasks have to agree on the
+    context.
     """
     return HistogramExperiment(
         optmodel=optmodel,
@@ -144,11 +150,14 @@ def histogram_experiment(deg=HIST_DEG, num_train=NUM_TRAIN,
         num_train=num_train,
         draw_size=HIST_DRAW,
         context_seed=HIST_CONTEXT_SEED,
+        context_margin=margin,
+        context_pool=HIST_CONTEXT_POOL,
         seed_fn=hist_seed_for,
     )
 
 
-def run_histogram(deg=HIST_DEG, num_train=NUM_TRAIN, NUM_TRIALS=5):
+def run_histogram(deg=HIST_DEG, num_train=NUM_TRAIN, NUM_TRIALS=5,
+                  margin=HIST_CONTEXT_MARGIN):
     """
     Vary training sets for a single fixed context and plot path selection histograms.
 
@@ -157,7 +166,9 @@ def run_histogram(deg=HIST_DEG, num_train=NUM_TRAIN, NUM_TRIALS=5):
     (bash slurm/run_histogram.sh).
     """
     experiment = histogram_experiment(deg=deg, num_train=num_train,
-                                      NUM_TRIALS=NUM_TRIALS)
+                                      NUM_TRIALS=NUM_TRIALS, margin=margin)
+    print(f"Fixed context #{experiment.context_index}: its best path beats the "
+          f"second-best by {experiment.margin:.2f}% (asked for >= {margin}%)")
 
     print(f"Running histogram experiment over {NUM_TRIALS} independent training "
           f"trials (n={num_train})...")

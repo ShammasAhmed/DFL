@@ -4,7 +4,9 @@ Collect the per-trial JSONs written by context_trial.py and draw the sweep's box
 One figure per training-set size, one panel per selected metric, so everything
 measured at that size sits in a single image. Within a panel, one group per DGP
 degree and one box per solver, each box summarizing the NUM_TRIALS trials of that
-cell.
+cell. Every panel of both figures sits on one shared y-axis, so the sizes can be
+compared by eye -- see plots.plot_regret_boxplots, which context_plot_from_csv.py
+draws through too.
 
 context_trial.py stores every metric it computed, so which panels get drawn is a choice
 made here, not there: --metrics re-plots an existing sweep under a different
@@ -28,11 +30,10 @@ import matplotlib
 # Backend has to be settled before anything imports pyplot (plots.py does, below).
 if "--show" not in sys.argv:
     matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 
 from sweep import (DEGREES, SIZES, NUM_TRIALS, SERIES, METRICS,  # noqa: E402
                    SHOW_METRICS, RESULT_DIR, result_path)
-from plots import RegretBoxPlot  # noqa: E402
+from plots import plot_regret_boxplots  # noqa: E402
 
 SOLVER_KEYS = [key for key, _, _ in SERIES]
 
@@ -87,38 +88,6 @@ def collect(records, metrics):
                 if value is not None:
                     by_size[n][metric][deg][key].append(value)
     return by_size
-
-
-def plot_size(by_size, metrics, num_train, outdir, show=False):
-    """Side-by-side boxplot panels, one per selected metric, for one training size."""
-    fig, axes = plt.subplots(1, len(metrics), figsize=(9 * len(metrics), 6.5),
-                             squeeze=False)
-
-    for ax, metric in zip(axes[0], metrics):
-        label = METRICS[metric].label
-        plotter = RegretBoxPlot(
-            groups=list(DEGREES),
-            series=SERIES,
-            xlabel="Polynomial degree of DGP",
-            ylabel=label,
-            title=label,
-        )
-        plotter.plot(by_size[num_train][metric], ax=ax)
-
-    fig.suptitle(
-        f"Pooled context regret over {NUM_TRIALS} trials per degree "
-        f"(5x5 grid shortest path, training set size = {num_train})",
-        fontsize=13, fontweight="bold",
-    )
-    fig.tight_layout()
-
-    path = outdir / f"regret_boxplots_n{num_train}.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    print(f"wrote {path}")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
 
 
 def write_csv(records, metrics, outdir):
@@ -213,8 +182,14 @@ def main(argv=None):
     by_size = collect(records, requested)
     print_medians(by_size, requested)
     write_csv(records, stored, outdir)
-    for num_train in SIZES:
-        plot_size(by_size, requested, num_train, outdir, show=args.show)
+    plot_regret_boxplots(
+        by_size, SIZES, [(m, METRICS[m].label) for m in requested], list(DEGREES),
+        SERIES, outdir,
+        xlabel="Polynomial degree of DGP",
+        suptitle=lambda n: (f"Pooled context regret over {NUM_TRIALS} trials per degree "
+                            f"(5x5 grid shortest path, training set size = {n})"),
+        show=args.show,
+    )
     return 0
 
 

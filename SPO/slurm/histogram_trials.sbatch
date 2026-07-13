@@ -1,8 +1,8 @@
 #!/bin/bash
 # One Slurm array task per trial of the histogram experiment.
 #
-#   2 sizes (100, 1000) x 500 trials = 1000 tasks, throttled to 25 running at once
-#   (%25). Each task trains all 3 solvers (SPO+, LASSO, GBM) on its own draw, so the
+#   2 sizes (100, 1000) x 500 trials = 1000 tasks, throttled to 40 running at once
+#   (%40). Each task trains all 3 solvers (SPO+, LASSO, GBM) on its own draw, so the
 #   array trains 3000 models against one fixed test context.
 #
 # Submit from the SPO/ directory -- normally via slurm/run_histogram.sh, which queues
@@ -16,7 +16,7 @@
 #SBATCH --partition=main
 #SBATCH --account=guptavis_1305
 #SBATCH --job-name=dfl-histogram
-#SBATCH --array=0-999%25
+#SBATCH --array=0-999%40
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
@@ -35,7 +35,7 @@ module load gcc/13.3.0 python/3.11.9
 source "$HOME/venvs/dfl/bin/activate"
 
 # Keep the numeric libraries inside the CPUs Slurm actually gave us; otherwise each of
-# the 25 concurrent tasks tries to grab the whole node.
+# the 40 concurrent tasks tries to grab the whole node.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"

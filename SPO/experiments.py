@@ -476,14 +476,20 @@ class HistogramExperiment:
             num_train + num_val; set it to the largest size's requirement to make a
             small-n trial a prefix of the large-n one at the same seed, which pairs
             the two arms on one draw instead of confounding them.
-        context_seed (int): Seed for the one fixed context
+        context_seed (int): Seed for the candidate contexts
+        context_margin (float): Minimum % by which the chosen context's best path must
+            beat its second-best, letting you plant a context with an obvious winner.
+            The first candidate clearing it is taken. 0.0 takes the first candidate,
+            i.e. an ordinary random context.
+        context_pool (int): Candidates to scan for one clearing context_margin
         seed_fn (callable): seed_fn(trial) -> int for the training draws. Must never
             return context_seed, or a trial would train on its own test context.
     """
 
     def __init__(self, optmodel, solvers, gen, NUM_TRIALS=50,
                  num_train=100, num_val=None, draw_size=None,
-                 context_seed=42, seed_fn=None):
+                 context_seed=42, context_margin=0.0, context_pool=1,
+                 seed_fn=None):
         if not getattr(gen, "fixed_dgp", False):
             raise ValueError(
                 "HistogramExperiment needs a generator with a fixed ground truth B "
@@ -500,6 +506,8 @@ class HistogramExperiment:
         self.draw_size = (self.num_train + self.num_val if draw_size is None
                           else draw_size)
         self.context_seed = context_seed
+        self.context_margin = context_margin
+        self.context_pool = context_pool
         self.seed_fn = seed_fn or (lambda trial: context_seed + 1000 + trial)
 
         if self.draw_size < self.num_train + self.num_val:
@@ -512,6 +520,8 @@ class HistogramExperiment:
 
         self.fixed_x = None
         self.fstar_X = None
+        self.context_index = None     # which candidate was chosen
+        self.margin = None            # its actual % gap from best path to second-best
         self.true_path_costs = None   # <f*, w> for every path, in path order
         self.sorted_indices = None    # paths, cheapest true cost first
         self.rank_of_path = None      # path index -> its rank in that ordering
@@ -521,22 +531,49 @@ class HistogramExperiment:
 
     def setup(self):
         """
-        Draw the fixed context and rank every path by its true expected cost.
+        Choose the fixed context and rank every path by its true expected cost.
 
-        Cheap and deterministic, so every Slurm task recomputes it and they all agree
-        on the context and the ranking without anything having to be shared between
-        them.
+        The context is the decision problem every model is graded on, and a typical
+        draw is an easy one to get away with getting wrong: the optimal path often
+        beats the runner-up by only a few percent, so a solver that misses it barely
+        pays. context_margin lets you insist on a context where the optimum wins by at
+        least that percentage instead -- an obvious best path, everything else costly.
+        The first candidate clearing the bar is taken, so the context is defined by a
+        stated condition rather than by being the most extreme of however many were
+        drawn.
+
+        The margin is measured on f* alone, and only the test context is chosen this
+        way: B, the noise, and every training draw are untouched, so the selection
+        cannot favour a method. Cheap and deterministic, so every Slurm task recomputes
+        it and they all agree without sharing anything.
 
         Raises:
-            ValueError: The generator supplies no f*, so the paths cannot be ranked.
+            ValueError: The generator supplies no f*, or no candidate in the pool
+                clears context_margin.
         """
-        sample = self.gen(1, self.context_seed)
-        if sample.fstar is None:
+        candidates = self.gen(self.context_pool, self.context_seed)
+        if candidates.fstar is None:
             raise ValueError(
                 "HistogramExperiment ranks paths by their true expected cost, so it "
                 "needs f*; build the generator with with_fstar=True")
-        self.fixed_x = sample.X[0]
-        self.fstar_X = sample.fstar[0]
+
+        # Gap from the best path to the second-best, as a % of the best, per candidate.
+        costs = candidates.fstar @ self.path_matrix.T      # (pool, num_paths)
+        best_two = np.partition(costs, 1, axis=1)[:, :2]
+        margins = 100 * (best_two[:, 1] - best_two[:, 0]) / best_two[:, 0]
+
+        clears = np.flatnonzero(margins >= self.context_margin)
+        if not len(clears):
+            raise ValueError(
+                f"No context in {self.context_pool} candidates has its best path "
+                f"beating the second-best by {self.context_margin}%; the largest gap "
+                f"found was {margins.max():.2f}%. Lower the margin, widen the pool, or "
+                f"raise the DGP degree -- a flatter DGP simply may not produce one.")
+
+        self.context_index = int(clears[0])
+        self.margin = float(margins[self.context_index])
+        self.fixed_x = candidates.X[self.context_index]
+        self.fstar_X = candidates.fstar[self.context_index]
 
         self.true_path_costs = self.path_matrix @ self.fstar_X
         # Stable, so ties between equal-cost paths rank the same way in every task.

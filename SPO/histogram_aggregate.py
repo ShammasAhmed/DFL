@@ -126,6 +126,11 @@ def write_csv(sorted_costs, counts, outdir):
 
 def print_summary(sorted_costs, counts, trials):
     """Per size and solver: how often the true optimum was found, and mean regret."""
+    margin = 100 * (sorted_costs[1] - sorted_costs[0]) / sorted_costs[0]
+    print(f"\nFixed context: the optimal path beats the second-best by {margin:.2f}%, "
+          f"and the worst by "
+          f"{100 * (sorted_costs[-1] - sorted_costs[0]) / sorted_costs[0]:.0f}%.")
+
     for num_train in HIST_SIZES:
         n_trials = trials[num_train]
         plotter = PathHistogramPlot(sorted_costs, n_trials, series=SERIES)
