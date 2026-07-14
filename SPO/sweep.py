@@ -59,21 +59,23 @@ class Metric(NamedTuple):
 #
 #   loss_Y          <Y, w_hat>                                 realized cost
 #   regret_Y        <Y, w_hat>  - <Y, z*(Y)>                   SPO regret
-#   regret_Y_lowvar <f*, w_hat> - <f*, z*(Y)>                  same decision pair as
-#                                                              regret_Y, scored under
-#                                                              f* instead of noisy Y,
-#                                                              hence lower variance
+#   regret_Y_lowvar <f*, w_hat> - <Y, z*(Y)>                   regret_Y with only the
+#                                                              solver's term scored under
+#                                                              f*; E<Y, w_hat> =
+#                                                              <f*, w_hat>, so the same
+#                                                              estimand with less noise
 #   regret_fstar    <f*, w_hat> - <f*, z*(f*)>                 gap to the best policy
 #
-# regret_Y_lowvar shares regret_Y's denominator so the two sit on one scale and can be
-# read side by side. Every entry is computed and persisted whenever f* is available --
-# selection happens at display time, so changing SHOW_METRICS never costs a rerun.
+# regret_Y_lowvar shares regret_Y's benchmark, and so its denominator: the two sit on one
+# scale and can be read side by side. Every entry is computed and persisted whenever f* is
+# available -- selection happens at display time, so changing SHOW_METRICS never costs a
+# rerun.
 METRICS = {
     "loss_Y":          Metric("Decision Loss", "Decision loss",
                               needs_fstar=False, denom="count"),
     "regret_Y":        Metric("Regret vs Y", r"Regret vs Y (%)",
                               needs_fstar=False, denom="opt_Y"),
-    "regret_Y_lowvar": Metric("Regret vs Y (f*)", r"Regret vs Y, $f^*$-scored (%)",
+    "regret_Y_lowvar": Metric("Regret vs Y (lv)", r"Regret vs Y, low-variance (%)",
                               needs_fstar=True, denom="opt_Y"),
     "regret_fstar":    Metric("Regret vs f*", r"Regret vs $f^*$ (%)",
                               needs_fstar=True, denom="opt_fstar"),

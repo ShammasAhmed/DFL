@@ -185,9 +185,11 @@ def run_histogram(deg=HIST_DEG, num_train=NUM_TRAIN, NUM_TRIALS=5,
 
 
 if __name__ == "__main__":
-    # run_contexts(deg=8, num_contexts=1000)
+    # run_contexts(deg=1, num_contexts=1000)
     # run_sweep(NUM_TRIALS=25)
 
     # A small local run. The full 500-trial x {100, 1000} grid trains 3000 models --
     # that one belongs on the cluster: bash slurm/run_histogram.sh
-    run_histogram(NUM_TRIALS=10)
+    run_histogram(deg = 1, NUM_TRIALS=1)
+    # run_histogram(deg = 4, NUM_TRIALS=1)
+    # run_histogram(deg = 8, NUM_TRIALS=1)

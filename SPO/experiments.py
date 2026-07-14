@@ -47,6 +47,29 @@ def metrics_for(has_fstar):
                  if has_fstar or not m.needs_fstar)
 
 
+# The raw cost sums every metric in sweep.METRICS is a ratio of differences of. Persisted
+# beside the metrics so that a new normalization -- or none at all -- is arithmetic on a
+# finished sweep rather than another run of it. Each maps term -> needs f*.
+#
+# SOLVER_TERMS differ per solver; BENCHMARK_TERMS are the same for every solver facing a
+# context. Writing <a, b> for sum over contexts of <a, b>:
+#
+#   loss_Y          <Y,  z*(f(X))>    the cost a method induces in practice
+#   fstar_at_hat    <f*, z*(f(X))>    the cost it induces in expectation
+#   opt_Y           <Y,  z*(Y)>       an oracle with perfect information about this draw
+#   opt_fstar       <f*, z*(f*)>      the best any method could do: what they approximate
+#   fstar_at_star_Y <f*, z*(Y)>       what the noisy-Y oracle's path really costs
+SOLVER_TERMS = {"loss_Y": False, "fstar_at_hat": True}
+BENCHMARK_TERMS = {"count": False, "opt_Y": False,
+                   "opt_fstar": True, "fstar_at_star_Y": True}
+
+
+def terms_for(has_fstar, registry):
+    """The terms of a registry (term -> needs f*) computable given whether f* exists."""
+    return tuple(term for term, needs_fstar in registry.items()
+                 if has_fstar or not needs_fstar)
+
+
 def build_path_matrix(optmodel):
     """
     Enumerate every monotone (right/down) source-to-sink path on the grid as a
@@ -202,10 +225,11 @@ class ContextExperiment:
 
         loss_Y          : <Y, w_hat>                     realized cost of the path
         regret_Y        : <Y, w_hat>  - <Y, z*(Y)>       SPO regret
-        regret_Y_lowvar : <f*, w_hat> - <f*, z*(Y)>      the same decision pair as
-                                                         regret_Y, but scored under f*
-                                                         rather than the noisy Y, so a
-                                                         lower-variance estimate of it
+        regret_Y_lowvar : <f*, w_hat> - <Y, z*(Y)>       regret_Y with only the solver's
+                                                         term scored under f*. w_hat does
+                                                         not depend on the noise, so
+                                                         E<Y, w_hat> = <f*, w_hat>: same
+                                                         estimand as regret_Y, less noise
         regret_fstar    : <f*, w_hat> - <f*, z*(f*)>     gap to the best policy
 
     The last two need f*, so they exist only when the generator supplies it. Everything
@@ -214,8 +238,8 @@ class ContextExperiment:
 
     loss_Y is a plain mean over contexts. The regrets are pooled as
     100 * (sum of regrets) / (sum of the corresponding optimal cost), the denominator
-    being sweep.METRICS[...].denom -- regret_Y and regret_Y_lowvar deliberately share
-    one, so the two sit on a single scale and can be read side by side.
+    being sweep.METRICS[...].denom -- regret_Y and regret_Y_lowvar share one because
+    they share a benchmark, <Y, z*(Y)>, so the two sit on a single scale.
 
     With shared_models=True (default) the solvers are trained once and every context is
     evaluated against those same models. With shared_models=False the solvers are
@@ -255,9 +279,13 @@ class ContextExperiment:
         self.has_fstar = gen(1, rng_seed).fstar is not None
         self.available = metrics_for(self.has_fstar)
         self.metrics = self._resolve_metrics(metrics)
+        self.solver_terms = terms_for(self.has_fstar, SOLVER_TERMS)
+        self.benchmark_terms = terms_for(self.has_fstar, BENCHMARK_TERMS)
 
         self.path_matrix = build_path_matrix(optmodel)
         self.table = None
+        self.terms = None      # key -> {solver term: sum over contexts}
+        self.totals = None     # benchmark term -> sum over contexts
 
     def _resolve_metrics(self, metrics):
         """
@@ -333,34 +361,43 @@ class ContextExperiment:
             fstar (np.ndarray | None): The context's conditional mean E[Y | X]
 
         Returns:
-            (denoms, per_solver): denoms maps a sweep.METRICS denom name to this
-                context's contribution to it; per_solver maps key -> {metric: value},
-                the values being the un-normalized numerators.
+            (benchmarks, per_solver, per_solver_terms): benchmarks maps a solver-
+                independent term (BENCHMARK_TERMS, the sweep.METRICS denom names among
+                them) to this context's contribution; per_solver maps key -> {metric:
+                value}, the values being the un-normalized numerators; per_solver_terms
+                maps key -> {term: value} over SOLVER_TERMS, the raw costs those
+                numerators are differences of.
         """
         z_star_Y = self._decision_argmin(y_ctx)          # z*(Y)
         opt_Y = float(y_ctx @ z_star_Y)                  # <Y, z*(Y)>
-        denoms = {"count": 1.0, "opt_Y": opt_Y, "opt_fstar": 0.0}
+        benchmarks = {"count": 1.0, "opt_Y": opt_Y}
 
         if fstar is not None:
             z_star_fstar = self._decision_argmin(fstar)  # z*(f*)
             opt_fstar = float(fstar @ z_star_fstar)      # <f*, z*(f*)>
-            fstar_at_star_Y = float(fstar @ z_star_Y)    # <f*, z*(Y)>
-            denoms["opt_fstar"] = opt_fstar
+            benchmarks["opt_fstar"] = opt_fstar
+            # No metric divides by this one. It is the true cost of the path a noisy-Y
+            # oracle picks, and the only term that tells a model's error apart from the
+            # noise's: <f*, z*(Y)> - <f*, z*(f*)> is what the noise alone costs.
+            benchmarks["fstar_at_star_Y"] = float(fstar @ z_star_Y)   # <f*, z*(Y)>
 
-        per_solver = {}
+        per_solver, per_solver_terms = {}, {}
         for key, solver in trained.items():
             z_hat = self._decision_argmin(predict(solver, x_ctx))  # z*(f(X))
             loss_Y = float(y_ctx @ z_hat)                                # <Y, z*(f(X))>
 
             values = {"loss_Y": loss_Y,
                       "regret_Y": loss_Y - opt_Y}
+            terms = {"loss_Y": loss_Y}
             if fstar is not None:
                 fstar_at_hat = float(fstar @ z_hat)      # <f*, z*(f(X))>
-                values["regret_Y_lowvar"] = fstar_at_hat - fstar_at_star_Y
+                values["regret_Y_lowvar"] = fstar_at_hat - opt_Y
                 values["regret_fstar"] = fstar_at_hat - opt_fstar
+                terms["fstar_at_hat"] = fstar_at_hat
             per_solver[key] = values
+            per_solver_terms[key] = terms
 
-        return denoms, per_solver
+        return benchmarks, per_solver, per_solver_terms
 
     def _context_iter(self):
         """Yield (trained_models, x, y, f*) for each context; f* is None without one."""
@@ -383,6 +420,10 @@ class ContextExperiment:
         """
         Train and evaluate over all contexts.
 
+        The raw cost sums the metrics are built from are kept too, on self.terms and
+        self.totals, so that a sweep can be renormalized -- or read unnormalized -- long
+        after it was run.
+
         Returns:
             table (dict): solver_key -> {metric: value} over every metric this
                 generator makes available (self.available), not merely the ones
@@ -392,15 +433,21 @@ class ContextExperiment:
         """
         sums = {key: {metric: 0.0 for metric in self.available}
                 for key, _ in self.solvers}
-        totals = {"count": 0.0, "opt_Y": 0.0, "opt_fstar": 0.0}
+        term_sums = {key: {term: 0.0 for term in self.solver_terms}
+                     for key, _ in self.solvers}
+        totals = {term: 0.0 for term in self.benchmark_terms}
 
         for trained, x_ctx, y_ctx, fstar in self._context_iter():
-            denoms, per_solver = self._eval_context(trained, x_ctx, y_ctx, fstar)
-            for name, value in denoms.items():
+            benchmarks, per_solver, per_solver_terms = self._eval_context(
+                trained, x_ctx, y_ctx, fstar)
+            for name, value in benchmarks.items():
                 totals[name] += value
             for key, values in per_solver.items():
                 for metric, value in values.items():
                     sums[key][metric] += value
+            for key, values in per_solver_terms.items():
+                for term, value in values.items():
+                    term_sums[key][term] += value
 
         def pool(key, metric):
             denom = METRICS[metric].denom
@@ -408,6 +455,8 @@ class ContextExperiment:
                 return sums[key][metric] / totals["count"]
             return 100 * sums[key][metric] / totals[denom]
 
+        self.terms = term_sums
+        self.totals = totals
         self.table = {
             key: {metric: pool(key, metric) for metric in self.available}
             for key, _ in self.solvers

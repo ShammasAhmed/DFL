@@ -90,23 +90,55 @@ def collect(records, metrics):
     return by_size
 
 
+# The raw cost sums beside the metrics, as (column, where it lives in the record, term).
+# Writing sum <a, b> for the sum over a trial's contexts of <a, b>, and z*(c) for the
+# path that minimizes c:
+#
+#   sum_Y_zmethod      <Y,  z*(f(X))>   what a method costs in practice, on this draw
+#   sum_fstar_zmethod  <f*, z*(f(X))>   what it costs in expectation
+#   sum_Y_zY           <Y,  z*(Y)>      an oracle told this draw's realized costs
+#   sum_fstar_zY       <f*, z*(Y)>      what that oracle's path really costs
+#   sum_fstar_zfstar   <f*, z*(f*)>     the best attainable: what every method aims at
+#
+# Every metric column is a ratio of differences of these (see sweep.METRICS), so the
+# normalization is recoverable, replaceable, or droppable from the CSV alone. The first
+# two vary by solver; the last three are the same for all three rows of a trial.
+SUM_COLUMNS = [
+    ("sum_Y_zmethod",     "terms",  "loss_Y"),
+    ("sum_fstar_zmethod", "terms",  "fstar_at_hat"),
+    ("sum_Y_zY",          "totals", "opt_Y"),
+    ("sum_fstar_zY",      "totals", "fstar_at_star_Y"),
+    ("sum_fstar_zfstar",  "totals", "opt_fstar"),
+]
+
+
 def write_csv(records, metrics, outdir):
     """
     Tidy one-row-per-(trial, solver) CSV, for whatever downstream stats you want.
 
-    Carries every metric the records hold, not just the plotted selection -- the CSV
-    is the archive, the panels are the view.
+    Carries every metric the records hold, not just the plotted selection, and the raw
+    cost sums behind them -- the CSV is the archive, the panels are the view. A record
+    missing a metric or a sum leaves that cell empty rather than failing, so a results/
+    directory of mixed vintage still aggregates.
     """
     path = outdir / "trials.csv"
-    lines = [",".join(["num_train", "deg", "trial", "seed", "solver", *metrics])]
+    columns = ["num_train", "deg", "trial", "seed", "solver", "num_contexts",
+               *metrics, *(name for name, _, _ in SUM_COLUMNS)]
+    lines = [",".join(columns)]
     for rec in sorted(records, key=lambda r: (r["num_train"], r["deg"], r["trial"])):
         for key in SOLVER_KEYS:
             m = rec["metrics"][key]
             values = [f"{m[metric]:.6f}" if metric in m else ""
                       for metric in metrics]
+            for _, where, term in SUM_COLUMNS:
+                source = rec.get(where, {})
+                if where == "terms":
+                    source = source.get(key, {})
+                value = source.get(term)
+                values.append(f"{value:.6f}" if value is not None else "")
             lines.append(
                 f"{rec['num_train']},{rec['deg']},{rec['trial']},{rec['seed']},"
-                f"{key}," + ",".join(values)
+                f"{key},{rec.get('num_contexts', '')}," + ",".join(values)
             )
     path.write_text("\n".join(lines) + "\n")
     print(f"wrote {path}")

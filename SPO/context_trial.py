@@ -22,7 +22,8 @@ import os
 import sys
 
 from main import optmodel, SOLVERS, gen_for
-from experiments import ContextExperiment, metrics_for
+from experiments import (ContextExperiment, metrics_for, terms_for,
+                         SOLVER_TERMS, BENCHMARK_TERMS)
 from sweep import (DEGREES, SIZES, NUM_TRIALS, NUM_CONTEXTS, RESULT_DIR,
                    SHOW_METRICS, seed_for, result_path)
 
@@ -49,6 +50,10 @@ def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DI
         "num_contexts": num_contexts,
         # Persist everything computed; context_aggregate.py selects columns at plot time.
         "metrics": {key: dict(table[key]) for key, _ in SOLVERS},
+        # And the raw cost sums the metrics are ratios of, so that renormalizing them --
+        # or dropping the normalization -- is arithmetic on the CSV rather than a rerun.
+        "terms": {key: dict(experiment.terms[key]) for key, _ in SOLVERS},
+        "totals": dict(experiment.totals),
     }
 
     path = result_path(outdir, deg, num_train, trial)
@@ -65,12 +70,12 @@ def is_reusable(path, gen):
     """
     Whether an existing trial JSON can stand in for recomputing this trial.
 
-    It can only if it already holds every metric a run today would compute. This is
-    what makes a resubmitted array safe: the resume path skips any trial whose JSON
-    exists, so a results/ directory written before a metric existed would otherwise
-    survive the resubmission untouched and go unnoticed until aggregation refused the
-    missing column -- two jobs and several hours later, with the array reporting
-    success. A stale or unreadable record is recomputed instead.
+    It can only if it already holds every metric AND every raw cost sum a run today
+    would compute. This is what makes a resubmitted array safe: the resume path skips
+    any trial whose JSON exists, so a results/ directory written before a metric existed
+    would otherwise survive the resubmission untouched and go unnoticed until aggregation
+    refused the missing column -- two jobs and several hours later, with the array
+    reporting success. A stale or unreadable record is recomputed instead.
 
     Inputs:
         path (Path): Where this trial's JSON would live
@@ -83,9 +88,17 @@ def is_reusable(path, gen):
         record = json.loads(path.read_text())
     except (OSError, ValueError):
         return False  # missing, truncated, or not JSON -- recompute
-    expected = set(metrics_for(gen(1, 0).fstar is not None))
-    stored = record.get("metrics", {})
-    return all(expected <= set(stored.get(key, {})) for key, _ in SOLVERS)
+    has_fstar = gen(1, 0).fstar is not None
+    expected = set(metrics_for(has_fstar))
+    expected_terms = set(terms_for(has_fstar, SOLVER_TERMS))
+    expected_totals = set(terms_for(has_fstar, BENCHMARK_TERMS))
+
+    metrics = record.get("metrics", {})
+    terms = record.get("terms", {})
+    return (expected_totals <= set(record.get("totals", {}))
+            and all(expected <= set(metrics.get(key, {}))
+                    and expected_terms <= set(terms.get(key, {}))
+                    for key, _ in SOLVERS))
 
 
 def parse_args(argv=None):
