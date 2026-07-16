@@ -55,9 +55,13 @@ SOLVERS = [
 optmodel = shortestPathModel(grid=GRID)
 
 
-def gen_for(deg, with_fstar=True):
-    """The DGP generator for one polynomial degree, at this run's shared config."""
-    return shortest_path_gen(GRID, P, h, deg, with_fstar=with_fstar)
+def gen_for(deg, noise_width=h, with_fstar=True):
+    """The DGP generator for one polynomial degree, at this run's shared config.
+
+    noise_width defaults to the module-level h; the sweep passes it explicitly so the
+    noise half-width can be set per run from the sbatch.
+    """
+    return shortest_path_gen(GRID, P, noise_width, deg, with_fstar=with_fstar)
 
 
 def fixed_dgp_gen_for(deg, dgp_seed=HIST_DGP_SEED, with_fstar=True):

@@ -8,7 +8,7 @@
 #   mkdir -p logs results
 #   sbatch slurm/context_trials.sbatch
 #
-# Each task writes results/deg{d}_n{n}_t{t}.json and skips itself if that file already
+# Each task writes results/deg{d}_n{n}_h{H}_t{t}.json and skips itself if that file already
 # exists AND holds every metric the current code computes, so resubmitting after a
 # failure only reruns the gaps -- while a results/ left over from before a metric was
 # added is recomputed rather than silently kept.
@@ -49,17 +49,24 @@ DEGREES=(1 2 4 6 8)
 SIZES=(100 1000)
 NUM_TRIALS=50
 
+# Multiplicative noise half-width (epsilon ~ U[1-H, 1+H]), shared by every task in the
+# array. It is recorded in each result JSON and in the filename, so a run at a different
+# H can share results/ without colliding. context_aggregate.py reads one H at a time
+# (its --h, default 0.5), so aggregate with --h "$H" to match.
+H=0.01
+
 T="$SLURM_ARRAY_TASK_ID"
 trial=$(( T % NUM_TRIALS ))
 cfg=$(( T / NUM_TRIALS ))
 deg="${DEGREES[$(( cfg % ${#DEGREES[@]} ))]}"
 n="${SIZES[$(( cfg / ${#DEGREES[@]} ))]}"
 
-echo "task ${T}: deg=${deg} num_train=${n} trial=${trial} on $(hostname)"
+echo "task ${T}: deg=${deg} num_train=${n} trial=${trial} h=${H} on $(hostname)"
 
 srun python context_trial.py \
     --deg "$deg" \
     --num-train "$n" \
     --trial "$trial" \
+    --noise-width "$H" \
     --num-contexts 1000 \
     --outdir results

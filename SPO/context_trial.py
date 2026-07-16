@@ -24,17 +24,18 @@ import sys
 from main import optmodel, SOLVERS, gen_for
 from experiments import (ContextExperiment, metrics_for, terms_for,
                          SOLVER_TERMS, BENCHMARK_TERMS)
-from sweep import (DEGREES, SIZES, NUM_TRIALS, NUM_CONTEXTS, RESULT_DIR,
-                   SHOW_METRICS, seed_for, result_path)
+from sweep import (DEGREES, SIZES, NUM_TRIALS, NUM_CONTEXTS, NOISE_WIDTH,
+                   RESULT_DIR, SHOW_METRICS, seed_for, result_path)
 
 
-def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DIR):
+def run_trial(deg, num_train, trial, noise_width=NOISE_WIDTH,
+              num_contexts=NUM_CONTEXTS, outdir=RESULT_DIR):
     """Run one trial and write its record to JSON. Returns the record."""
     seed = seed_for(deg, trial)
     experiment = ContextExperiment(
         optmodel=optmodel,
         solvers=SOLVERS,
-        gen=gen_for(deg),
+        gen=gen_for(deg, noise_width),
         num_contexts=num_contexts,
         shared_models=True,
         num_train=num_train,
@@ -47,6 +48,7 @@ def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DI
         "num_train": num_train,
         "trial": trial,
         "seed": seed,
+        "h": noise_width,
         "num_contexts": num_contexts,
         # Persist everything computed; context_aggregate.py selects columns at plot time.
         "metrics": {key: dict(table[key]) for key, _ in SOLVERS},
@@ -56,7 +58,7 @@ def run_trial(deg, num_train, trial, num_contexts=NUM_CONTEXTS, outdir=RESULT_DI
         "totals": dict(experiment.totals),
     }
 
-    path = result_path(outdir, deg, num_train, trial)
+    path = result_path(outdir, deg, num_train, trial, noise_width)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write-then-rename: a task killed mid-write leaves no half-parsed JSON for
     # context_aggregate.py to trip over.
@@ -106,6 +108,10 @@ def parse_args(argv=None):
     parser.add_argument("--deg", type=int, required=True, choices=DEGREES)
     parser.add_argument("--num-train", type=int, required=True, choices=SIZES)
     parser.add_argument("--trial", type=int, required=True)
+    parser.add_argument("--noise-width", type=float, default=NOISE_WIDTH,
+                        help="Multiplicative noise half-width h (epsilon ~ U[1-h, 1+h]). "
+                             "Recorded in the JSON and in the filename, so trials at "
+                             f"different h coexist in one results dir (default: {NOISE_WIDTH}).")
     parser.add_argument("--num-contexts", type=int, default=NUM_CONTEXTS)
     parser.add_argument("--outdir", default=str(RESULT_DIR))
     parser.add_argument("--overwrite", action="store_true",
@@ -120,14 +126,16 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    path = result_path(args.outdir, args.deg, args.num_train, args.trial)
+    path = result_path(args.outdir, args.deg, args.num_train, args.trial,
+                       args.noise_width)
     if path.exists() and not args.overwrite:
-        if is_reusable(path, gen_for(args.deg)):
+        if is_reusable(path, gen_for(args.deg, args.noise_width)):
             print(f"{path} exists, skipping (pass --overwrite to recompute)")
             return 0
         print(f"{path} is unreadable or predates the current metric set, recomputing")
 
     record = run_trial(args.deg, args.num_train, args.trial,
+                       noise_width=args.noise_width,
                        num_contexts=args.num_contexts, outdir=args.outdir)
     # The JSON holds every metric; the log line shows the selected ones.
     parts = [
@@ -136,7 +144,7 @@ def main(argv=None):
         for key, m in record["metrics"].items()
     ]
     print(f"deg={record['deg']} n={record['num_train']} trial={record['trial']} "
-          f"seed={record['seed']}: " + "  |  ".join(parts))
+          f"h={record['h']} seed={record['seed']}: " + "  |  ".join(parts))
     print(f"wrote {path}")
     return 0
 

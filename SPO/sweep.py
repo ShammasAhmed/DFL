@@ -21,6 +21,11 @@ RNG_SEED = 143
 # Number of test contexts each trial pools its regrets over.
 NUM_CONTEXTS = 1000
 
+# Default multiplicative noise half-width (epsilon ~ U[1-h, 1+h]). The sbatch can
+# override it per run via --noise-width; this is the fallback for a bare context_trial.py
+# invocation and the value context_aggregate.py assumes when selecting which files to read.
+NOISE_WIDTH = 0.5
+
 RESULT_DIR = Path("results")
 
 # (key, label, color) per solver, for plot legends. Imported by main.py too, so
@@ -142,6 +147,12 @@ def seed_for(deg, trial):
     return RNG_SEED + 1000 * deg + trial
 
 
-def result_path(outdir, deg, num_train, trial):
-    """One JSON per trial, so the array job is restartable cell by cell."""
-    return Path(outdir) / f"deg{deg}_n{num_train}_t{trial}.json"
+def result_path(outdir, deg, num_train, trial, h=NOISE_WIDTH):
+    """
+    One JSON per trial, so the array job is restartable cell by cell.
+
+    The noise half-width h is in the name so trials at different noise levels can share
+    one results/ directory without colliding -- and so the resume check never mistakes a
+    trial run at one h for the same (deg, size, trial) run at another.
+    """
+    return Path(outdir) / f"deg{deg}_n{num_train}_h{h}_t{trial}.json"

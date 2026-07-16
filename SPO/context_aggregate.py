@@ -32,20 +32,20 @@ if "--show" not in sys.argv:
     matplotlib.use("Agg")
 
 from sweep import (DEGREES, SIZES, NUM_TRIALS, SERIES, METRICS,  # noqa: E402
-                   SHOW_METRICS, RESULT_DIR, result_path)
+                   SHOW_METRICS, NOISE_WIDTH, RESULT_DIR, result_path)
 from plots import plot_regret_boxplots  # noqa: E402
 
 SOLVER_KEYS = [key for key, _, _ in SERIES]
 
 
-def load_records(results_dir):
-    """Read every trial JSON. Returns (records, missing) with missing as cells."""
+def load_records(results_dir, h=NOISE_WIDTH):
+    """Read every trial JSON at noise width h. Returns (records, missing) as cells."""
     records = []
     missing = []
     for num_train in SIZES:
         for deg in DEGREES:
             for trial in range(NUM_TRIALS):
-                path = result_path(results_dir, deg, num_train, trial)
+                path = result_path(results_dir, deg, num_train, trial, h)
                 if not path.exists():
                     missing.append((deg, num_train, trial))
                     continue
@@ -122,7 +122,7 @@ def write_csv(records, metrics, outdir):
     directory of mixed vintage still aggregates.
     """
     path = outdir / "trials.csv"
-    columns = ["num_train", "deg", "trial", "seed", "solver", "num_contexts",
+    columns = ["num_train", "deg", "trial", "seed", "h", "solver", "num_contexts",
                *metrics, *(name for name, _, _ in SUM_COLUMNS)]
     lines = [",".join(columns)]
     for rec in sorted(records, key=lambda r: (r["num_train"], r["deg"], r["trial"])):
@@ -138,7 +138,7 @@ def write_csv(records, metrics, outdir):
                 values.append(f"{value:.6f}" if value is not None else "")
             lines.append(
                 f"{rec['num_train']},{rec['deg']},{rec['trial']},{rec['seed']},"
-                f"{key},{rec.get('num_contexts', '')}," + ",".join(values)
+                f"{rec.get('h', '')},{key},{rec.get('num_contexts', '')}," + ",".join(values)
             )
     path.write_text("\n".join(lines) + "\n")
     print(f"wrote {path}")
@@ -165,6 +165,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", default=str(RESULT_DIR),
                         help="Directory of per-trial JSONs from context_trial.py")
+    parser.add_argument("--h", type=float, default=NOISE_WIDTH,
+                        help="Noise half-width to read (files are named by h, so one "
+                             f"results dir may hold several; default: {NOISE_WIDTH}).")
     parser.add_argument("--outdir", default=".",
                         help="Where to write the PNGs and CSV")
     parser.add_argument("--metrics", default=",".join(SHOW_METRICS),
@@ -175,7 +178,7 @@ def main(argv=None):
                         help="Display the figures (off by default; headless on a node)")
     args = parser.parse_args(argv)
 
-    records, missing = load_records(args.results)
+    records, missing = load_records(args.results, args.h)
     if not records:
         print(f"No trial JSONs found in {args.results}/ -- has the array job run?",
               file=sys.stderr)
