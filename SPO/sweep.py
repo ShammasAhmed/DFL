@@ -8,6 +8,7 @@ the optimization stack, the *_aggregate.py scripts (plotting) must not, so the t
 they agree on -- which cells exist, which seed each cell gets, and what the metrics
 mean -- live here.
 """
+import json
 from pathlib import Path
 from typing import NamedTuple
 
@@ -105,13 +106,29 @@ HIST_NUM_TRIALS = 500
 HIST_DGP_SEED = RNG_SEED        # fixes B, and so the true path costs
 HIST_CONTEXT_SEED = RNG_SEED    # draws the candidate contexts to choose from
 
-# The % by which the context's best path must beat the second-best must fall in
-# [HIST_CONTEXT_MARGIN, HIST_CONTEXT_MARGIN_MAX]. Raise the floor to plant an obvious
-# winner; lower the ceiling to plant a near-tie. Selection sees only f*; the training
-# draws are untouched. (0.0, None) is an ordinary random context.
-HIST_CONTEXT_MARGIN = 0.0
-HIST_CONTEXT_MARGIN_MAX = 0.1
-HIST_CONTEXT_POOL = 200_000     # candidates scanned for the first one in the window
+# The sorted-cost profile the fixed context is chosen to have. Rank 0 = the true
+# optimum; a gap between ranks lo and hi is 100*(cost[hi]-cost[lo])/cost[lo]. Selection
+# sees only f*; the training draws are untouched. Set exactly ONE of these:
+#   HIST_RANK_GAPS   (hard) first context whose every gap sits in its [min,max] window;
+#                    the old single margin is just the (0,1,...) line. max None =
+#                    unbounded. Over-constrain and the scan finds nothing -- widen a
+#                    window or raise HIST_CONTEXT_POOL.
+#   HIST_RANK_TARGET (soft) context whose gaps sit closest to the targets; never fails,
+#                    but the achieved shape may drift. Entries are (lo,hi,target[,weight]).
+# Leave the other None. ((0,1,0.0,0.1),) / None is a top-2 near-tie, the previous default.
+HIST_RANK_GAPS = (
+    # (lo_rank, hi_rank, min_pct, max_pct)      max_pct None = unbounded
+    (0, 1, 0.0, 0.1),
+)
+HIST_RANK_TARGET = None          # e.g. ((0, 1, 0.05), (4, 5, 20.0, 2.0)); set GAPS=None
+HIST_CONTEXT_POOL = 200_000      # candidates scanned per selection
+
+
+def parse_gap_spec(s):
+    """CLI/env JSON -> tuple of gap tuples; empty string -> None (use sweep default)."""
+    if not s:
+        return None
+    return tuple(tuple(g) for g in json.loads(s))
 
 # Every trial draws this many rows regardless of training-set size, then takes the
 # first num_train for training and the next num_train // 4 for validation. Sizing the

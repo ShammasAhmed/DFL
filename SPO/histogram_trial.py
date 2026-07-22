@@ -27,8 +27,8 @@ import numpy as np
 
 from main import histogram_experiment, SOLVERS
 from sweep import (HIST_DEG, HIST_SIZES, HIST_NUM_TRIALS, HIST_RESULT_DIR,
-                   HIST_DGP_SEED, HIST_CONTEXT_SEED, HIST_CONTEXT_MARGIN,
-                   HIST_CONTEXT_MARGIN_MAX, hist_seed_for, hist_result_path)
+                   HIST_DGP_SEED, HIST_CONTEXT_SEED, parse_gap_spec,
+                   hist_seed_for, hist_result_path)
 
 SOLVER_KEYS = [key for key, _ in SOLVERS]
 
@@ -51,7 +51,7 @@ def run_trial(experiment, num_train, trial, deg=HIST_DEG, outdir=HIST_RESULT_DIR
         "dgp_seed": HIST_DGP_SEED,
         "context_seed": HIST_CONTEXT_SEED,
         # Which candidate context was selected, and by how much its best path beats the
-        # second-best. Both follow from HIST_CONTEXT_MARGIN, so they pin down what this
+        # second-best. Both follow from the rank-gap spec, so they pin down what this
         # trial was actually graded against.
         "context_index": experiment.context_index,
         "context_margin": experiment.margin,
@@ -75,8 +75,8 @@ def is_reusable(path, experiment):
     Whether an existing trial JSON can stand in for recomputing this trial.
 
     It can only if it holds a decision for every solver we run today AND was graded
-    against the context we would use today. The second check is what makes changing
-    HIST_CONTEXT_MARGIN safe: a new margin picks a different context, and without it a
+    against the context we would use today. The second check is what makes changing the
+    rank-gap spec safe: a new spec picks a different context, and without it a
     resubmitted array would skip every trial whose JSON already exists and hand you a
     histogram of the OLD context's ranks under a new context's cost curve -- wrong, and
     silently so. A stale, unreadable, or differently-graded record is recomputed.
@@ -99,6 +99,12 @@ def parse_args(argv=None):
     parser.add_argument("--num-train", type=int, required=True, choices=HIST_SIZES)
     parser.add_argument("--trial", type=int, required=True)
     parser.add_argument("--deg", type=int, default=HIST_DEG)
+    parser.add_argument("--rank-gaps", default="",
+                        help="JSON [[lo,hi,min_pct,max_pct],...] hard shape spec; "
+                             "overrides sweep default. Exclusive with --rank-target.")
+    parser.add_argument("--rank-target", default="",
+                        help="JSON [[lo,hi,target_pct,(weight)],...] soft shape spec; "
+                             "overrides sweep default. Exclusive with --rank-gaps.")
     parser.add_argument("--outdir", default=str(HIST_RESULT_DIR))
     parser.add_argument("--overwrite", action="store_true",
                         help="Recompute even if this trial's JSON already exists "
@@ -115,10 +121,12 @@ def main(argv=None):
     # Built before the reuse check, since deciding whether a cached record is still
     # valid means knowing which context we would grade against today.
     experiment = histogram_experiment(deg=args.deg, num_train=args.num_train,
-                                      NUM_TRIALS=HIST_NUM_TRIALS)
-    print(f"context #{experiment.context_index}: best path beats second-best by "
-          f"{experiment.margin:.4f}% (window "
-          f"[{HIST_CONTEXT_MARGIN}%, {HIST_CONTEXT_MARGIN_MAX}%])")
+                                      NUM_TRIALS=HIST_NUM_TRIALS,
+                                      rank_gaps=parse_gap_spec(args.rank_gaps),
+                                      rank_target=parse_gap_spec(args.rank_target))
+    gaps = ", ".join(f"rank {lo}->{hi}: {g:.4f}%"
+                     for lo, hi, g in experiment.rank_gaps_achieved)
+    print(f"context #{experiment.context_index}: {gaps}")
 
     path = hist_result_path(args.outdir, args.num_train, args.trial)
     if path.exists() and not args.overwrite:

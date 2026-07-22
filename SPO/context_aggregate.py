@@ -5,7 +5,7 @@ One figure per training-set size, one panel per selected metric, so everything
 measured at that size sits in a single image. Within a panel, one group per DGP
 degree and one box per solver, each box summarizing the NUM_TRIALS trials of that
 cell. Every panel of both figures sits on one shared y-axis, so the sizes can be
-compared by eye -- see plots.plot_regret_boxplots, which context_plot_from_csv.py
+compared by eye -- see plots.plot_regret_boxplots, which plots.plot_regret_from_csv
 draws through too.
 
 context_trial.py stores every metric it computed, so which panels get drawn is a choice

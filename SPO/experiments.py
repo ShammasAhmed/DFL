@@ -527,10 +527,18 @@ class HistogramExperiment:
             the two arms on one draw instead of confounding them.
         context_seed (int): Seed for the candidate contexts
         context_margin (float): Minimum % by which the chosen context's best path must
-            beat its second-best. Raise it to plant an obvious winner.
+            beat its second-best. Raise it to plant an obvious winner. A shorthand for
+            rank_gaps=((0,1,context_margin,context_margin_max),) when neither of the two
+            below is given.
         context_margin_max (float): Maximum for the same gap; None for no cap. Lower it
             to plant a near-tie, where the top two paths are all but indistinguishable.
-        context_pool (int): Candidates to scan for the first one inside the window
+        rank_gaps (list): Hard shape spec -- (lo,hi,min_pct,max_pct) per constrained
+            rank gap; the first candidate clearing every window wins. max_pct None =
+            unbounded. Generalizes context_margin past the top-two.
+        rank_target (list): Soft shape spec -- (lo,hi,target_pct[,weight]) per rank gap;
+            the candidate minimizing the weighted squared error to the targets wins, so
+            it never fails to select. Mutually exclusive with rank_gaps.
+        context_pool (int): Candidates to scan per selection
         seed_fn (callable): seed_fn(trial) -> int for the training draws. Must never
             return context_seed, or a trial would train on its own test context.
     """
@@ -538,7 +546,7 @@ class HistogramExperiment:
     def __init__(self, optmodel, solvers, gen, NUM_TRIALS=50,
                  num_train=100, num_val=None, draw_size=None,
                  context_seed=42, context_margin=0.0, context_margin_max=None,
-                 context_pool=1, seed_fn=None):
+                 rank_gaps=None, rank_target=None, context_pool=1, seed_fn=None):
         if not getattr(gen, "fixed_dgp", False):
             raise ValueError(
                 "HistogramExperiment needs a generator with a fixed ground truth B "
@@ -558,6 +566,22 @@ class HistogramExperiment:
         self.context_margin = context_margin
         self.context_margin_max = (np.inf if context_margin_max is None
                                    else context_margin_max)
+
+        # The context's shape spec: hard windows (rank_gaps) or soft targets
+        # (rank_target), never both. Absent either, fall back to the top-two margin.
+        if rank_gaps is not None and rank_target is not None:
+            raise ValueError("Pass rank_gaps OR rank_target, not both")
+        if rank_target is not None:
+            self.rank_target = [(lo, hi, tgt, (extra[0] if extra else 1.0))
+                                for lo, hi, tgt, *extra in rank_target]
+            self.rank_gaps = None
+        else:
+            self.rank_target = None
+            self.rank_gaps = (tuple(rank_gaps) if rank_gaps is not None
+                              else ((0, 1, context_margin,
+                                     None if self.context_margin_max == np.inf
+                                     else self.context_margin_max),))
+
         self.context_pool = context_pool
         self.seed_fn = seed_fn or (lambda trial: context_seed + 1000 + trial)
 
@@ -573,6 +597,7 @@ class HistogramExperiment:
         self.fstar_X = None
         self.context_index = None     # which candidate was chosen
         self.margin = None            # its actual % gap from best path to second-best
+        self.rank_gaps_achieved = None  # [(lo, hi, achieved %)] for the spec's gaps
         self.true_path_costs = None   # <f*, w> for every path, in path order
         self.sorted_indices = None    # paths, cheapest true cost first
         self.rank_of_path = None      # path index -> its rank in that ordering
@@ -584,13 +609,14 @@ class HistogramExperiment:
         """
         Choose the fixed context and rank every path by its true expected cost.
 
-        The context is the decision problem every model is graded on, and how much the
-        best path beats the second-best by decides what kind of problem it is. Raise
-        context_margin for an obvious winner (missing it is expensive); lower
-        context_margin_max for a near-tie (the top two are indistinguishable, so even a
-        good model flips between them -- but misses cost almost nothing). The first
-        candidate inside the window is taken, so the context is defined by a stated
-        condition rather than by being the most extreme of however many were drawn.
+        The context is the decision problem every model is graded on, and the shape of
+        its sorted cost curve decides what kind of problem it is. rank_gaps states hard
+        windows on chosen rank gaps and takes the first candidate clearing all of them,
+        so the context is defined by a stated condition rather than by being the most
+        extreme of however many were drawn; rank_target instead takes the candidate whose
+        gaps sit closest to the targets, so it never fails to select. Either way you can
+        plant an obvious winner (a wide top-two gap), a near-tie (a tiny one), or a cliff
+        between two rank groups.
 
         The margin is measured on f* alone, and only the test context is chosen this
         way: B, the noise, and every training draw are untouched, so the selection
@@ -598,8 +624,8 @@ class HistogramExperiment:
         it and they all agree without sharing anything.
 
         Raises:
-            ValueError: The generator supplies no f*, or no candidate in the pool falls
-                inside the margin window.
+            ValueError: The generator supplies no f*, a spec names a rank the grid has
+                no path for, or (rank_gaps only) no candidate clears every window.
         """
         candidates = self.gen(self.context_pool, self.context_seed)
         if candidates.fstar is None:
@@ -607,23 +633,44 @@ class HistogramExperiment:
                 "HistogramExperiment ranks paths by their true expected cost, so it "
                 "needs f*; build the generator with with_fstar=True")
 
-        # Gap from the best path to the second-best, as a % of the best, per candidate.
-        costs = candidates.fstar @ self.path_matrix.T      # (pool, num_paths)
-        best_two = np.partition(costs, 1, axis=1)[:, :2]
-        margins = 100 * (best_two[:, 1] - best_two[:, 0]) / best_two[:, 0]
+        # Every candidate's sorted cost curve, cheapest first; gaps are read off it.
+        costs = np.sort(candidates.fstar @ self.path_matrix.T, axis=1)  # (pool, npaths)
 
-        clears = np.flatnonzero((margins >= self.context_margin)
-                                & (margins <= self.context_margin_max))
-        if not len(clears):
-            raise ValueError(
-                f"No context in {self.context_pool} candidates has its best path "
-                f"beating the second-best by between {self.context_margin}% and "
-                f"{self.context_margin_max}%; the gaps found run "
-                f"{margins.min():.4f}% to {margins.max():.2f}%. Widen the window or "
-                f"the pool.")
+        def gap(lo, hi):
+            if not (0 <= lo < hi < self.num_paths):
+                raise ValueError(
+                    f"rank gap ({lo},{hi}) out of range for {self.num_paths} paths")
+            return 100 * (costs[:, hi] - costs[:, lo]) / costs[:, lo]
 
-        self.context_index = int(clears[0])
-        self.margin = float(margins[self.context_index])
+        if self.rank_target is not None:               # soft: closest to the targets
+            err = sum(w * (gap(lo, hi) - tgt) ** 2
+                      for lo, hi, tgt, w in self.rank_target)
+            self.context_index = int(np.argmin(err))
+            active = self.rank_target
+        else:                                          # hard: first clearing all windows
+            ok = np.ones(len(costs), dtype=bool)
+            passed_alone = []
+            for lo, hi, lo_pct, hi_pct in self.rank_gaps:
+                g = gap(lo, hi)
+                c = (g >= lo_pct) & (g <= (np.inf if hi_pct is None else hi_pct))
+                passed_alone.append((lo, hi, int(c.sum())))
+                ok &= c
+            clears = np.flatnonzero(ok)
+            if not len(clears):
+                diag = ", ".join(f"gap({lo},{hi}) alone: {n}"
+                                 for lo, hi, n in passed_alone)
+                raise ValueError(
+                    f"No context in {self.context_pool} candidates clears all "
+                    f"{len(self.rank_gaps)} rank-gap windows ({diag}). Loosen the "
+                    f"tightest, raise context_pool, or switch to a soft rank_target.")
+            self.context_index = int(clears[0])
+            active = self.rank_gaps
+
+        chosen = costs[self.context_index]
+        self.margin = float(100 * (chosen[1] - chosen[0]) / chosen[0])
+        self.rank_gaps_achieved = [
+            (lo, hi, float(100 * (chosen[hi] - chosen[lo]) / chosen[lo]))
+            for lo, hi, *_ in active]
         self.fixed_x = candidates.X[self.context_index]
         self.fstar_X = candidates.fstar[self.context_index]
 

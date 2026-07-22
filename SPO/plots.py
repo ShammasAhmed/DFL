@@ -129,8 +129,8 @@ def plot_regret_boxplots(by_size, sizes, panels, groups, series, outdir,
     regret_Y_lowvar routinely goes negative, since z*(Y) chases the noise and is
     beatable under f*.
 
-    Both context_aggregate.py (from the per-trial JSONs) and context_plot_from_csv.py
-    (from trials.csv) draw through here, so the two produce the same figures.
+    Both context_aggregate.py (from the per-trial JSONs) and plot_regret_from_csv
+    (from a trials CSV) draw through here, so the two produce the same figures.
 
     Inputs:
         by_size (dict): by_size[num_train][metric][group][series_key] -> trial values
@@ -189,6 +189,53 @@ def plot_regret_boxplots(by_size, sizes, panels, groups, series, outdir,
         for _, fig, _ in figures:
             plt.close(fig)
     return paths
+
+
+# Raw regret is the numerator of each normalized metric -- the method's cost minus its
+# benchmark, before the division by the optimal cost (see context_aggregate.SUM_COLUMNS).
+# Mapped metric -> (method sum column, benchmark sum column).
+RAW_REGRET_TERMS = {
+    "regret_fstar":    ("sum_fstar_zmethod", "sum_fstar_zfstar"),
+    "regret_Y_lowvar": ("sum_fstar_zmethod", "sum_Y_zY"),
+    "regret_Y":        ("sum_Y_zmethod",     "sum_Y_zY"),
+}
+
+
+def plot_raw_regret_boxplots(by_sums, sizes, panels, groups, series, outdir,
+                             xlabel="", suptitle=None,
+                             filename="raw_regret_boxplots_n{n}.png",
+                             show=False, dpi=150):
+    """
+    plot_regret_boxplots, but each box is raw regret in cost units -- the numerator
+    alone, averaged per context -- instead of a percentage of the optimal cost.
+
+    Un-normalizing is the whole difference: for each trial it takes the method's cost
+    sum minus its benchmark (RAW_REGRET_TERMS) and divides by that trial's context
+    count, then hands the result to plot_regret_boxplots to draw. Every panel of both
+    figures still shares one y-axis, and here that is exact rather than a compromise,
+    since all three raw regrets are in the same cost units.
+
+    Inputs:
+        by_sums (dict): by_sums[num_train][deg][series_key] -> list of per-trial dicts,
+            each holding the sum columns named in RAW_REGRET_TERMS plus "num_contexts".
+        sizes, panels, groups, series, outdir, xlabel, suptitle, filename, show, dpi:
+            as in plot_regret_boxplots. `panels` labels should read in cost units, not %.
+    """
+    by_size = {
+        n: {metric: {g: {} for g in groups} for metric, _ in panels}
+        for n in sizes
+    }
+    for n in sizes:
+        for metric, _label in panels:
+            method_col, bench_col = RAW_REGRET_TERMS[metric]
+            for g in groups:
+                for key, _lbl, _color in series:
+                    by_size[n][metric][g][key] = [
+                        (t[method_col] - t[bench_col]) / t["num_contexts"]
+                        for t in by_sums[n][g].get(key, [])]
+    return plot_regret_boxplots(by_size, sizes, panels, groups, series, outdir,
+                                xlabel=xlabel, suptitle=suptitle, filename=filename,
+                                show=show, dpi=dpi)
 
 
 class PathHistogramPlot:
@@ -336,3 +383,137 @@ class PathHistogramPlot:
             fontsize=13, fontweight="bold")
         fig.tight_layout()
         return fig
+
+
+def plot_regret_from_csv(csv_path, tag="h05", noise_h=0.5, outdir=".",
+                         show=False, dpi=150):
+    """
+    Redraw the sweep's regret boxplots straight from a trials CSV -- both the normalized
+    regret (% of optimal) and the raw regret in cost units. Same figures
+    context_aggregate.py draws from the per-trial JSONs (plot_regret_boxplots /
+    plot_raw_regret_boxplots); this is the from-CSV path, with no optimization stack.
+
+    Inputs:
+        csv_path (str): The trials CSV written by the sweep
+        tag (str): Filename tag keeping this noise level's figures distinct
+        noise_h (float): Noise half-width, for the figure titles only
+        outdir (Path|str): Where the PNGs are written
+        show (bool): Display the figures instead of closing them
+        dpi (int): Resolution of the saved PNGs
+
+    Returns:
+        paths (list): The files written
+    """
+    import csv
+    from collections import defaultdict
+    from pathlib import Path
+    from sweep import DEGREES, SIZES, SERIES, METRICS, SHOW_METRICS
+
+    solver_keys = [key for key, _, _ in SERIES]
+    sum_cols = sorted({col for pair in RAW_REGRET_TERMS.values() for col in pair})
+
+    # normalized: by_size[num_train][metric][deg][solver] -> list of trial values
+    # raw sums:   by_sums[num_train][deg][solver]         -> list of per-trial {col: val}
+    by_size = {n: {m: {deg: defaultdict(list) for deg in DEGREES} for m in SHOW_METRICS}
+               for n in SIZES}
+    by_sums = {n: {deg: defaultdict(list) for deg in DEGREES} for n in SIZES}
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            n, deg, key = int(row["num_train"]), int(row["deg"]), row["solver"]
+            if n in by_size and deg in DEGREES and key in solver_keys:  # skip stray rows
+                for m in SHOW_METRICS:
+                    by_size[n][m][deg][key].append(float(row[m]))
+                by_sums[n][deg][key].append(
+                    {c: float(row[c]) for c in (*sum_cols, "num_contexts")})
+
+    outdir = Path(outdir)
+    paths = plot_regret_boxplots(
+        by_size, SIZES, [(m, METRICS[m].label) for m in SHOW_METRICS], list(DEGREES),
+        SERIES, outdir,
+        xlabel="Polynomial degree of DGP",
+        filename=f"regret_boxplots_{tag}_n{{n}}.png",
+        suptitle=lambda n: ("Pooled context regret over 50 trials per degree "
+                            f"(5x5 grid shortest path, noise h={noise_h}, "
+                            f"training set size = {n})"),
+        show=show, dpi=dpi,
+    )
+    paths += plot_raw_regret_boxplots(
+        by_sums, SIZES,
+        [(m, METRICS[m].label.replace("(%)", "(mean cost/context)")) for m in SHOW_METRICS],
+        list(DEGREES), SERIES, outdir,
+        xlabel="Polynomial degree of DGP",
+        filename=f"raw_regret_boxplots_{tag}_n{{n}}.png",
+        suptitle=lambda n: ("Raw context regret over 50 trials per degree "
+                            f"(5x5 grid shortest path, noise h={noise_h}, "
+                            f"training set size = {n})"),
+        show=show, dpi=dpi,
+    )
+    return paths
+
+
+def plot_noise_discount(csv_path, tag="h05", outdir=".",
+                        filename="noise_discount_{tag}.png", suptitle=None,
+                        show=False, dpi=150):
+    """
+    Line plot of the noise discount: how much cheaper the best decision that knows the
+    realized cost Y is than the best decision that knows only E[Y|X]=f*.
+
+    Per context and trial this is (Regret vs Y, low-variance) - (Regret vs f*), which
+    reduces to (sum_fstar_zfstar - sum_Y_zY) / num_contexts: the solver's own decision
+    cancels, and so does the trained model -- both z*(Y) and z*(f*) are model-free, so
+    the discount is a property of the DGP alone. It is therefore pooled across every
+    training-set size into one line over DGP degree. Unnormalized (raw cost per context,
+    averaged over contexts and trials, never divided by an optimal cost) and
+    non-negative -- knowing Y only helps.
+
+    Inputs:
+        csv_path (str): The trials CSV written by the sweep
+        tag (str): Filename tag distinguishing this noise level's figure
+        outdir (Path|str): Where the PNG is written
+        filename (str): Output name, formatted with `tag`
+        suptitle (str): Figure title. Omit for none.
+        show (bool): Display instead of closing
+        dpi (int): Resolution of the saved PNG
+
+    Returns:
+        path (Path): The file written
+    """
+    import csv
+    from pathlib import Path
+    from sweep import DEGREES, SERIES
+
+    rep_solver = SERIES[0][0]   # discount is solver-independent; read one solver's rows
+
+    # discounts[deg] -> per-trial discounts (raw cost per context), pooled over sizes
+    discounts = {deg: [] for deg in DEGREES}
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["solver"] != rep_solver:
+                continue
+            deg = int(row["deg"])
+            if deg in discounts:
+                discounts[deg].append(
+                    (float(row["sum_fstar_zfstar"]) - float(row["sum_Y_zY"]))
+                    / float(row["num_contexts"]))
+
+    degrees = list(DEGREES)
+    means = [np.mean(discounts[deg]) for deg in degrees]
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    ax.plot(degrees, means, marker="o", color="tab:purple")
+    ax.axhline(0.0, color="black", linestyle=":", linewidth=1.0, zorder=0)
+    ax.set_xlabel("Polynomial degree of DGP")
+    ax.set_ylabel("Noise discount (mean cost/context)")
+    ax.set_xticks(degrees)
+    ax.grid(True, linestyle=":", alpha=0.5)
+    if suptitle is not None:
+        fig.suptitle(suptitle, fontsize=13, fontweight="bold")
+    fig.tight_layout()
+
+    path = Path(outdir) / filename.format(tag=tag)
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    print(f"wrote {path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return path

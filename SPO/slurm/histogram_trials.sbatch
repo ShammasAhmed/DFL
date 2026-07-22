@@ -54,7 +54,23 @@ n="${SIZES[$(( T / NUM_TRIALS ))]}"
 
 echo "task ${T}: num_train=${n} trial=${trial} on $(hostname)"
 
+# --- Context shape -----------------------------------------------------------
+# The sorted-cost profile every task grades against. Set exactly ONE (leave the other
+# ''). Rank 0 = true optimum; a gap between ranks lo and hi is 100*(cost[hi]-cost[lo])
+# /cost[lo]; max_pct null = unbounded.
+#   RANK_GAPS   (hard) JSON [[lo,hi,min_pct,max_pct],...]; first context clearing every
+#               window. e.g. '[[0,1,0.0,0.1],[4,5,15,null]]' = top-2 near-tie AND a
+#               >=15% cliff between the top-5 cluster and rank 6.
+#   RANK_TARGET (soft) JSON [[lo,hi,target_pct,(weight)],...]; nearest context, never
+#               fails. e.g. '[[0,1,0.05],[4,5,20,2]]'.
+# Both '' -> sweep.py defaults. One line, read by every task, so they can't disagree;
+# changing it repicks the context and stale trials recompute themselves.
+RANK_GAPS=''
+RANK_TARGET=''
+
 srun python histogram_trial.py \
     --num-train "$n" \
     --trial "$trial" \
+    --rank-gaps "$RANK_GAPS" \
+    --rank-target "$RANK_TARGET" \
     --outdir results_histogram
