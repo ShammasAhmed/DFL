@@ -37,11 +37,16 @@ class Sample(NamedTuple):
 
 
 def numpy_shortest_path_gen(grid: tuple, P: int, h: float, deg: int,
-                            dgp_seed: int, with_fstar: bool = True
+                            dgp_seed: int, with_fstar: bool = True,
+                            noise: str = "multiplicative"
                             ) -> Callable[[int, int], Sample]:
     """
     The same DGP as shortest_path_gen -- PyEPO's cost model, term for term -- but with
     the ground truth B pinned at build time instead of redrawn from every sample seed.
+
+    Noise is multiplicative by default (PyEPO's model, Y = mean * U[1-h, 1+h]) or
+    additive via noise="additive" (Y = mean + U[-h, h]). Both are mean-preserving, so
+    f* = E[Y | X] = mean either way.
 
     PyEPO's genData draws B from the sample seed, so gen(n, seed_1) and gen(n, seed_2)
     come from two different ground truths. Experiments whose every trial is one draw
@@ -58,10 +63,12 @@ def numpy_shortest_path_gen(grid: tuple, P: int, h: float, deg: int,
     Inputs:
         grid (tuple): Size of the grid network, e.g. (5, 5)
         P (int): Covariate dimension
-        h (float): Multiplicative noise half-width
+        h (float): Noise half-width. Multiplicative: eps ~ U[1-h, 1+h]; additive:
+            eps ~ U[-h, h]. h=0 is noiseless (Y = mean) under either mode.
         deg (int): Polynomial degree of the feature-to-cost mapping
         dgp_seed (int): Seed for B, i.e. for the ground truth itself
         with_fstar (bool): Also return E[Y | X]
+        noise (str): "multiplicative" (Y = mean * eps) or "additive" (Y = mean + eps)
 
     Returns:
         gen (callable): gen(n, seed) -> Sample, carrying gen.B and gen.fixed_dgp=True
@@ -75,10 +82,15 @@ def numpy_shortest_path_gen(grid: tuple, P: int, h: float, deg: int,
         rnd = np.random.RandomState(seed)
         X = rnd.normal(0, 1, (n, P))
         mean = ((X @ B.T / np.sqrt(P) + 3) ** deg + 1) / 3.5 ** deg  # E[Y | X]
-        epsilon = rnd.uniform(1 - h, 1 + h, (n, d))
-        Y = (mean * epsilon).astype(np.float32)
+        if noise == "multiplicative":
+            Y = mean * rnd.uniform(1 - h, 1 + h, (n, d))
+        elif noise == "additive":
+            Y = mean + rnd.uniform(-h, h, (n, d))
+        else:
+            raise ValueError(
+                f"noise must be 'multiplicative' or 'additive', got {noise!r}")
         fstar = mean.astype(np.float32) if with_fstar else None
-        return Sample(X, Y, fstar)
+        return Sample(X, Y.astype(np.float32), fstar)
 
     # An experiment needing a fixed ground truth checks this rather than trusting the
     # caller to have handed it the right generator.

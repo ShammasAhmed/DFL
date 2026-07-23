@@ -31,7 +31,8 @@ from pyepo.model.grb import shortestPathModel
 
 from datagen import shortest_path_gen, numpy_shortest_path_gen
 from solvers import GBMTwoStage, LASSOTwoStage, LinearSPOPlus
-from experiments import RegretExperiment, ContextExperiment, HistogramExperiment
+from experiments import (RegretExperiment, ContextExperiment, HistogramExperiment,
+                         build_path_matrix)
 from plots import RegretBoxPlot, plot_noise_discount, plot_regret_from_csv
 from sweep import (RNG_SEED, SERIES, SHOW_METRICS,
                    HIST_DEG, HIST_NUM_TRIALS, HIST_DGP_SEED, HIST_CONTEXT_SEED,
@@ -223,7 +224,94 @@ def run_histogram(deg=HIST_DEG, num_train=NUM_TRAIN, NUM_TRIALS=5,
     return experiment.results
 
 
+def run_noise_tables(degrees=(1, 2, 4, 6, 8), noises=(0.0, 0.5), num_test=1000,
+                     dgp_seed=HIST_DGP_SEED, seed=RNG_SEED):
+    """
+    Print the noiseless-vs-noisy oracle gap E[<f*, z*(f*)>] - E[<Y, z*(Y)>], additive
+    against multiplicative noise, one table per noise half-width.
+
+    No training: for each (mode, h, degree) it draws num_test contexts and dots the
+    enumerated paths against f* and Y. z*(Y) is free to exploit each draw's noise, so
+    the gap is >= 0 -- how much a clairvoyant-noise oracle beats the mean-optimal
+    policy. f* = E[Y|X] = mean under both modes (and X is drawn before the noise at a
+    shared seed), so the <f*, z*(f*)> column is identical across them and shown once.
+    """
+    path_matrix = build_path_matrix(optmodel)
+
+    def opt_cost(costs):  # per-row <c, z*(c)> = min over enumerated paths
+        return (costs @ path_matrix.T).min(axis=1)
+
+    def row(deg, h):
+        def draw(mode):
+            gen = numpy_shortest_path_gen(GRID, P, h, deg, dgp_seed=dgp_seed,
+                                          noise=mode)
+            return gen(num_test, seed)
+        add, mult = draw("additive"), draw("multiplicative")
+        e_fstar = float(opt_cost(add.fstar).mean())      # == mult's, f* is shared
+        e_Y_add = float(opt_cost(add.Y).mean())
+        e_Y_mult = float(opt_cost(mult.Y).mean())
+        return e_fstar, e_Y_add, e_fstar - e_Y_add, e_Y_mult, e_fstar - e_Y_mult
+
+    for h in noises:
+        print(f"Noise half-width h={h}  ({num_test} test contexts)   "
+              f"additive eps~U[-h,h]  |  multiplicative eps~U[1-h,1+h]")
+        print(f"{'deg':>4}{'E[<f*,z*(f*)>]':>16}"
+              f"{'add E[<Y,z*(Y)>]':>18}{'add gap':>10}"
+              f"{'mult E[<Y,z*(Y)>]':>19}{'mult gap':>10}")
+        print("-" * 77)
+        for deg in degrees:
+            e_fstar, e_Y_add, gap_add, e_Y_mult, gap_mult = row(deg, h)
+            print(f"{deg:>4}{e_fstar:>16.4f}"
+                  f"{e_Y_add:>18.4f}{gap_add:>+10.4f}"
+                  f"{e_Y_mult:>19.4f}{gap_mult:>+10.4f}")
+        print()
+
+
+def plot_noise_gaps(degrees=(1, 2, 4, 6, 8), h=0.5, num_test=1000,
+                    dgp_seed=HIST_DGP_SEED, seed=RNG_SEED,
+                    savepath="noise_discount.png"):
+    """
+    Plot the oracle gap E[<f*, z*(f*)>] - E[<Y, z*(Y)>] against DGP degree, one curve
+    each for additive and multiplicative noise at half-width h.
+
+    The gap is the same training-free quantity run_noise_tables prints; here it is
+    drawn as two curves so the opposite way the two noise types fall off with degree
+    is visible at a glance.
+    """
+    import matplotlib.pyplot as plt
+
+    path_matrix = build_path_matrix(optmodel)
+
+    def gap(deg, mode):
+        s = numpy_shortest_path_gen(GRID, P, h, deg, dgp_seed=dgp_seed,
+                                    noise=mode)(num_test, seed)
+        opt = lambda c: (c @ path_matrix.T).min(axis=1)  # <c, z*(c)> per row
+        return float(opt(s.fstar).mean() - opt(s.Y).mean())
+
+    add = [gap(d, "additive") for d in degrees]
+    mult = [gap(d, "multiplicative") for d in degrees]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(degrees, add, "o-", color="tab:blue", label="additive  $U[-h,h]$")
+    ax.plot(degrees, mult, "s-", color="tab:orange",
+            label="multiplicative  $U[1-h,1+h]$")
+    ax.set_xlabel("Polynomial degree of DGP")
+    ax.set_ylabel(r"Oracle gap  $E[\langle f^*, z^*(f^*)\rangle] - "
+                  r"E[\langle Y, z^*(Y)\rangle]$")
+    ax.set_title(f"Noise discount vs degree (h={h}, {num_test} contexts)")
+    ax.set_xticks(list(degrees))
+    ax.grid(linestyle=":", alpha=0.5)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    print(f"wrote {savepath}")
+    return fig
+
+
 if __name__ == "__main__":
+    run_noise_tables()
+    plot_noise_gaps()
+
     # run_contexts(deg=1, num_contexts=1000)
     # run_sweep(NUM_TRIALS=25)
 
@@ -239,4 +327,4 @@ if __name__ == "__main__":
     # A small end-to-end run (trains models; needs Gurobi). Same spec argument as above.
     # The full 500-trial x {100, 1000} grid trains 3000 models -- that belongs on the
     # cluster: bash slurm/run_histogram.sh
-    run_histogram(deg=4, NUM_TRIALS=25, rank_target='[[0,1,0.05],[4,5,20,2]]')
+    # run_histogram(deg=4, NUM_TRIALS=25, rank_target='[[0,1,0.05],[4,5,20,2]]')
